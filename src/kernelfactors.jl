@@ -11,12 +11,13 @@ supported:
   - `bickley`
   - `gaussian`
   - `IIRGaussian` (approximate gaussian filtering, fast even for large σ)
+  - `DCTGaussian` (approximate gaussian filtering, fast even for large σ)
 
 See also: [`Kernel`](@ref).
 """
 module KernelFactors
 
-using StaticArrays, OffsetArrays
+using LinearAlgebra, StaticArrays, OffsetArrays
 using ..ImageFiltering: centered, dummyind
 import ..ImageFiltering: _reshape, _vec, nextendeddims
 using Base: tail, Indices, @pure, checkbounds_indices, throw_boundserror, @propagate_inbounds
@@ -34,6 +35,10 @@ using ImageFiltering
 abstract type IIRFilter{T} end
 
 Base.eltype(kernel::IIRFilter{T}) where {T} = T
+
+abstract type DCTFilter{T} end
+
+Base.eltype(kernel::DCTFilter{T}) where {T} = T
 
 """
     ReshapedOneD{N,Npre}(data)
@@ -568,6 +573,79 @@ end
 iirg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, emit_warning) where {T} =
     (ReshapedOneD(pre, IIRGaussian(T, σs[1]; emit_warning=emit_warning), ()),)
 
+###### DCT
+
+struct DCT_7{T} <: DCTFilter{T}
+    basis::Matrix{T}
+    coefficients::Vector{T}
+end
+Base.vec(kernel::DCT_7) = kernel
+Base.ndims(kernel::DCT_7) = 1
+Base.ndims(::Type{T}) where {T <: DCT_7} = 1
+Base.axes1(kernel::DCT_7) = 0:0
+Base.axes(kernel::DCT_7) = (Base.axes1(kernel), )
+Base.isempty(kernel::DCT_7) = false
+
+iterdims(inds::Indices{1}, kern::DCT_7) = (), inds[1], ()
+_reshape(kern::DCT_7, ::Val{1}) = kern
+
+"""
+    DCTGaussian([T], σ; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3)
+
+Defines a kernel for one-dimensional discrete cosine transform 7 (DCT-7) 
+approximation to a Gaussian of standard deviation `σ` which preserves
+the first 2 moments. `R` is the filter window radius and `K` is the
+approximation order. `σ` may either be a single real number or a tuple
+of numbers; in the latter case, a tuple of such filters will be created,
+each for filtering a different dimension of an array.
+
+Optionally specify the type `T` for the filter coefficients; if not
+supplied, it will match `σ` (unless `σ` is not floating-point, in
+which case `Float64` will be chosen).
+
+# Citation
+
+K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for dct-based constant-time 
+gaussian filter with moment preservation". IEEE international conference on acoustics,
+speech and signal processing (ICASSP) 1498-1502 (2018).
+"""
+function DCTGaussian(::Type{T}, σ::Real; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3) where T
+    # there is probably a way to optimize this and reduce allocation?
+    w = 2 * R - 1 # DCT-7
+    W = Diagonal([0.5;ones(R - 1)])
+    C = [cos((2 * π / w) * (k + 0.5) * r) for r in 0:(R - 1), k in 0:(K - 1)] # DCT-7 basis
+    μ = [1.0;σ ^ 2] # first 2 moments of the gaussian
+    P = hcat(ones(R), [r ^ 2 for r in 0:(R - 1)])
+    h = [exp(-(r ^ 2) / (2 * σ ^ 2)) for r in 0:(R - 1)]
+    h ./= h[1] + 2 * sum(view(h, 2:R))
+    A = Diagonal((4 / w) * [ones(K - 1);0.5]) # A =  inv(C' * W * C)
+    B = C' * W
+    U = B * P
+    hls = A * B * h # least square solution without moment constraints
+    Sinv = inv(U' * A * U)
+    return DCT_7(C, hls - A * U * Sinv * (U' * hls - 0.5 * μ)) # correct the sign error from the original paper
+end
+DCTGaussian(σ::Real; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3) = DCTGaussian(dctgt(σ), σ; R = R, K = K)
+
+function DCTGaussian(::Type{T}, σs::NTuple{N, Real}; R::NTuple{N, Int} = ntuple(d -> (6 * ceil(Int, σs[d]) + 1) >> 1, Val(N)), K::Int = 3) where {T, N}
+    dctg(T, (), σs, tail(ntuple(d -> true, Val(N))), R, K)
+end
+DCTGaussian(σs::Tuple; R::Tuple = map(s -> (6 * ceil(Int, s) + 1) >> 1, σs), K::Int = 3) = DCTGaussian(dctgt(σs), σs; R = R, K = K)
+
+DCTGaussian(σs::AbstractVector; kwargs...) = DCTGaussian((σs...,); kwargs...)
+DCTGaussian(::Type{T}, σs::AbstractVector; kwargs...) where {T} = DCTGaussian(T, (σs...,); kwargs...)
+
+dctgt(σ::AbstractFloat) = typeof(σ)
+dctgt(σ::Real) = Float64
+dctgt(σs::Tuple) = promote_type(map(dctgt, σs)...)
+
+@inline function dctg(::Type{T}, pre, σs, post, R, K) where T
+    kern = ReshapedOneD(pre, DCTGaussian(T, σs[1]; R = R[1], K = K), post)
+    (kern, dctg(T, (pre..., post[1]), tail(σs), tail(post), tail(R), K)...)
+end
+dctg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, R, K) where {T} =
+    (ReshapedOneD(pre, DCTGaussian(T, σs[1]; R = R[1], K = K), ()),)
+
 ###### Utilities
 
 """
@@ -608,6 +686,7 @@ if Base.VERSION >= v"1.4.2" && ccall(:jl_generating_output, Cint, ()) == 1
         precompile(gaussian, (T,))
         precompile(gaussian, (T, Int))
         precompile(IIRGaussian, (Tuple{T,T},))
+        precompile(DCTGaussian, (Tuple{T,T},))
     end
 end
 
