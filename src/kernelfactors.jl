@@ -658,7 +658,7 @@ function DCTcoeff(::Type{D}, h::OffsetVector{T}, μ::NTuple{M, Tuple{Int, T}}; K
     U = B * P
     Uhls = U' * hls # will be U' * hls - 0.5 * μ
     for m in 1:M
-        Uhls[m] -= 0.5 * μ[m][2]
+        @inbounds Uhls[m] -= 0.5 * μ[m][2]
     end
     Sinv = inv(U' * A * U)
     return D(C, hls - A * U * Sinv * Uhls)
