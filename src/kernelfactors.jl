@@ -610,20 +610,10 @@ gaussian filter with moment preservation". IEEE international conference on acou
 speech and signal processing (ICASSP) 1498-1502 (2018).
 """
 function DCTGaussian(::Type{T}, σ::Real; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3) where T
-    # there is probably a way to optimize this and reduce allocation?
-    w = 2 * R - 1 # DCT-7
-    W = Diagonal([0.5;ones(R - 1)])
-    C = [cos((2 * π / w) * (k + 0.5) * r) for r in 0:(R - 1), k in 0:(K - 1)] # DCT-7 basis
-    μ = [1.0;σ ^ 2] # first 2 moments of the gaussian
-    P = hcat(ones(R), [r ^ 2 for r in 0:(R - 1)])
-    h = [exp(-(r ^ 2) / (2 * σ ^ 2)) for r in 0:(R - 1)]
-    h ./= h[1] + 2 * sum(view(h, 2:R))
-    A = Diagonal((4 / w) * [ones(K - 1);0.5]) # A =  inv(C' * W * C)
-    B = C' * W
-    U = B * P
-    hls = A * B * h # least square solution without moment constraints
-    Sinv = inv(U' * A * U)
-    return DCT_7(C, hls - A * U * Sinv * (U' * hls - 0.5 * μ)) # correct the sign error from the original paper
+    h = OffsetArray([exp(-x ^ 2 / T(2 * σ ^ 2)) for x in 0:(R - 1)], 0:(R - 1))
+    h ./= h[0] + 2 * sum(view(h, 1:(R - 1)))
+    μ = ((0, one(T)), (2, T(σ ^ 2)))
+    return DCTcoeff(DCT_7, h, μ; K = K)
 end
 DCTGaussian(σ::Real; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3) = DCTGaussian(dctgt(σ), σ; R = R, K = K)
 
@@ -645,6 +635,58 @@ dctgt(σs::Tuple) = promote_type(map(dctgt, σs)...)
 end
 dctg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, R, K) where {T} =
     (ReshapedOneD(pre, DCTGaussian(T, σs[1]; R = R[1], K = K), ()),)
+
+# From a kernel h and a set of moments μ, compute the DCT coefficients where the DCT type is given by D.
+# the type of the kernel and of the moments is used to determine the type of the coefficients.
+# Due to the symmetry of the DCT only the positive part of the kernel is used.
+function DCTcoeff(::Type{D}, h::OffsetVector{T}, μ::NTuple{M, Tuple{Int, T}}; K::Int = 3) where {D <: DCTFilter, T, M}
+    @assert checkindex(Bool, eachindex(h), 0) "The kernel ´h´ must be centered"
+    firstindex(h) != 0 && DCTcoeff(D, OffsetArray(view(h, 0:lastindex(h)), 0:lastindex(h)), μ; K = K)
+    R = length(h)
+    W = Diagonal([T(0.5);ones(T, R - 1)]) # weight matrix for DCT symmetry
+    C = DCTbasis(T, D, R, K) # DCT basis
+    A = DCT_CWCinv(D, C, W) # A =  inv(C' * W * C)
+    B = C' * W
+    hls = A * B * OffsetArrays.no_offset_view(h) # least square solution without moment constraints
+    M == 0 && return D(C, hls) # no moment constraints
+    P = zeros(Int, R, M)
+    for m = 1:M
+        for r = 1:R
+            @inbounds P[r, m] = (r - 1) ^ μ[m][1]
+        end
+    end
+    U = B * P
+    Uhls = U' * hls # will be U' * hls - 0.5 * μ
+    for m in 1:M
+        Uhls[m] -= 0.5 * μ[m][2]
+    end
+    Sinv = inv(U' * A * U)
+    return D(C, hls - A * U * Sinv * Uhls)
+end
+function DCTcoeff(::Type{D}, h::AbstractVector{T}, μ::NTuple{M, Tuple{Int, T}}; K::Int = 3) where {D <: DCTFilter, T, M}
+    R = 1 + length(h) >> 1
+    return DCTcoeff(D, OffsetArray(view(h, R:length(h)), 0:R), μ; K = K)
+end
+
+# Given the filter window radius and the approximation order K 
+# create the matrix for the DCT basis where the DCT type is given by D.
+function DCTbasis(::Type{T}, ::Type{D}, R::Int, K::Int) where {T, D <: DCTFilter}
+    w, k0, r0 = DCTparams(T, D, R)
+    return [cos(T(2 * π / w) * (k + k0) * (r + r0)) for r in 0:(R - 1), k in 0:(K - 1)]
+end
+
+# DCT-7 parameters (period length w and phase shifts k0 and r0)
+function DCTparams(::Type{T}, ::Type{DCT_7}, R::Int) where T
+    w = 2 * R - 1
+    k0 = T(0.5)
+    r0 = zero(T)
+    return (w, k0, r0)
+end
+
+# Compute (C' * W * C)^-1 for the DCT-7 (C is the DCT basis and W is the weight matrix)
+function DCT_CWCinv(::Type{DCT_7}, C::Matrix{T}, W::Diagonal{T}) where T
+    return Diagonal(T(4 / (2 * size(C, 1) - 1)) * [ones(T, size(C, 2) - 1);T(0.5)])
+end
 
 ###### Utilities
 
