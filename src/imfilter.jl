@@ -1206,6 +1206,7 @@ function filter_algorithm(out, img, kernel::Union{ArrayType,Tuple{Vararg{ArrayTy
     isa(kernel, Tuple) && length(kernel) > 1 ? FIRTiled(padded_tilesize(eltype(out), sz)) : FIR()
 end
 filter_algorithm(out, img, kernel::Tuple{AnyIIR,Vararg{AnyIIR}}) = IIR()
+filter_algorithm(out, img, kernel::Tuple{AnyDCT_DST,Vararg{AnyDCT_DST}}) = DCT_DST()
 filter_algorithm(out, img, kernel) = Mixed()
 
 maxlen(A::AbstractArray) = length(A)

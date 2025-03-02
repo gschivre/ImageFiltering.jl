@@ -59,27 +59,28 @@ module Algorithm
         tilesize::Dims{N}
     end
     "Filter with an Infinite Impulse Response filter" struct IIR <: Alg end
-    "Filter with an reccursive Discrete Cosine Transform filter" struct DCT <: Alg end
+    "Filter with a reccursive Discrete Cosine/Sine Transform filter" struct DCT_DST <: Alg end
     "Filter with a cascade of mixed types (IIR, FIR)" struct Mixed <: Alg end
 
     FIRTiled() = FIRTiled(())
 end
-using .Algorithm: Alg, FFT, FIR, FIRTiled, IIR, DCT, Mixed
+using .Algorithm: Alg, FFT, FIR, FIRTiled, IIR, DCT_DST, Mixed
 
 Alg(r::AbstractResource{A}) where {A<:Alg} = r.settings
 
 include("utils.jl")
 include("compat.jl")
 include("kernelfactors.jl")
-using .KernelFactors: TriggsSdika, IIRFilter, DCTFilter, ReshapedOneD, iterdims, kernelfactors
+using .KernelFactors: TriggsSdika, IIRFilter, DCTFilter, DSTFilter, ReshapedOneD, iterdims, kernelfactors
 
 ReshapedVector{T,N,Npre,V<:AbstractVector} = ReshapedOneD{T,N,Npre,V}
 ArrayType{T} = Union{AbstractArray{T}, ReshapedVector{T}}
 ReshapedIIR{T,N,Npre,V<:IIRFilter} = ReshapedOneD{T,N,Npre,V}
 AnyIIR{T} = Union{IIRFilter{T}, ReshapedIIR{T}}
 ReshapedDCT{T,N,Npre,V<:DCTFilter} = ReshapedOneD{T,N,Npre,V}
-AnyDCT{T} = Union{DCTFilter{T}, ReshapedDCT{T}}
-ArrayLike{T} = Union{ArrayType{T}, AnyIIR{T}, AnyDCT{T}}
+ReshapedDST{T,N,Npre,V<:DSTFilter} = ReshapedOneD{T,N,Npre,V}
+AnyDCT_DST{T} = Union{DCTFilter{T}, ReshapedDCT{T}, DSTFilter{T}, ReshapedDST{T}}
+ArrayLike{T} = Union{ArrayType{T}, AnyIIR{T}, AnyDCT_DST{T}}
 
 include("kernel.jl")
 using .Kernel

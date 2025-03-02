@@ -40,6 +40,10 @@ abstract type DCTFilter{T} end
 
 Base.eltype(kernel::DCTFilter{T}) where {T} = T
 
+abstract type DSTFilter{T} end
+
+Base.eltype(kernel::DSTFilter{T}) where {T} = T
+
 """
     ReshapedOneD{N,Npre}(data)
 
@@ -573,21 +577,43 @@ end
 iirg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, emit_warning) where {T} =
     (ReshapedOneD(pre, IIRGaussian(T, σs[1]; emit_warning=emit_warning), ()),)
 
-###### DCT
+###### DCT/DST
 
+struct DCT_1{T} <: DCTFilter{T}
+    basis::Matrix{T}
+    coefficients::Vector{T}
+end
+struct DCT_3{T} <: DCTFilter{T}
+    basis::Matrix{T}
+    coefficients::Vector{T}
+end
+struct DCT_5{T} <: DCTFilter{T}
+    basis::Matrix{T}
+    coefficients::Vector{T}
+end
 struct DCT_7{T} <: DCTFilter{T}
     basis::Matrix{T}
     coefficients::Vector{T}
 end
-Base.vec(kernel::DCT_7) = kernel
-Base.ndims(kernel::DCT_7) = 1
-Base.ndims(::Type{T}) where {T <: DCT_7} = 1
-Base.axes1(kernel::DCT_7) = 0:0
-Base.axes(kernel::DCT_7) = (Base.axes1(kernel), )
-Base.isempty(kernel::DCT_7) = false
 
-iterdims(inds::Indices{1}, kern::DCT_7) = (), inds[1], ()
-_reshape(kern::DCT_7, ::Val{1}) = kern
+# only the DCT types with no spatial phase shift
+DCTtypes = Union{DCT_1, DCT_3, DCT_5, DCT_7}
+Base.vec(kernel::DCTtypes) = kernel
+Base.ndims(kernel::DCTtypes) = 1
+Base.ndims(::Type{T}) where {T <: DCTtypes} = 1
+Base.axes1(kernel::DCTtypes) = 0:0
+Base.axes(kernel::DCTtypes) = (Base.axes1(kernel), )
+Base.isempty(kernel::DCTtypes) = false
+
+iterdims(inds::Indices{1}, kern::DCTtypes) = (), inds[1], ()
+_reshape(kern::DCTtypes, ::Val{1}) = kern
+
+approxorder(d::DCTtypes) = size(d.basis, 2)
+@inline function Base.show(io::IO, mime::MIME"text/plain", d::DCTtypes)
+    halfh = d.basis * d.coefficients
+    h = centered(vcat(view(halfh, lastindex(halfh):-1:2), halfh))
+    show(io, mime, h)
+end
 
 """
     DCTGaussian([T], σ; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3)
@@ -669,14 +695,59 @@ function DCTcoeff(::Type{D}, h::AbstractVector{T}, μ::NTuple{M, Tuple{Int, T}};
 end
 
 # Given the filter window radius and the approximation order K 
-# create the matrix for the DCT basis where the DCT type is given by D.
+# create the matrix for the DCT/DST basis where the DCT/DST type is given by D.
 function DCTbasis(::Type{T}, ::Type{D}, R::Int, K::Int) where {T, D <: DCTFilter}
-    w, k0, r0 = DCTparams(T, D, R)
+    w, k0, r0 = DCT_DST_params(T, D, R)
     return [cos(T(2 * π / w) * (k + k0) * (r + r0)) for r in 0:(R - 1), k in 0:(K - 1)]
+end
+function DSTbasis(::Type{T}, ::Type{D}, R::Int, K::Int) where {T, D <: DSTFilter}
+    w, k0, r0 = DCT_DST_params(T, D, R)
+    return [sin(T(2 * π / w) * (k + k0) * (r + r0)) for r in 0:(R - 1), k in 0:(K - 1)]
+end
+
+# DCT-1 parameters (period length w and phase shifts k0 and r0)
+function DCT_DST_params(::Type{T}, ::Type{DCT_1}, R::Int) where T
+    w = 2 * R - 2
+    k0 = zero(T)
+    r0 = zero(T)
+    return (w, k0, r0)
+end
+
+# Compute (C' * W * C)^-1 for the DCT-1 (C is the DCT basis and W is the weight matrix)
+function DCT_CWCinv(::Type{DCT_1}, C::Matrix{T}, W::Diagonal{T}) where T
+    Mkinv = T(4 / (2 * size(C, 1) - 2)) * Diagonal([T(0.5);ones(T, size(C, 2) - 1)])
+    s = [(-1) ^ k for k in 0:(size(C, 2) - 1)]
+    return Mkinv * (I - (s * s' * Mkinv) / T(2 + s' * Mkinv * s))
+end
+
+# DCT-3 parameters (period length w and phase shifts k0 and r0)
+function DCT_DST_params(::Type{T}, ::Type{DCT_3}, R::Int) where T
+    w = 2 * R
+    k0 = T(0.5)
+    r0 = zero(T)
+    return (w, k0, r0)
+end
+
+# Compute (C' * W * C)^-1 for the DCT-3 (C is the DCT basis and W is the weight matrix)
+function DCT_CWCinv(::Type{DCT_3}, C::Matrix{T}, W::Diagonal{T}) where T
+    return Diagonal(T(4 / (2 * size(C, 1))) * ones(T, size(C, 2)))
+end
+
+# DCT-5 parameters (period length w and phase shifts k0 and r0)
+function DCT_DST_params(::Type{T}, ::Type{DCT_5}, R::Int) where T
+    w = 2 * R - 1
+    k0 = zero(T)
+    r0 = zero(T)
+    return (w, k0, r0)
+end
+
+# Compute (C' * W * C)^-1 for the DCT-5 (C is the DCT basis and W is the weight matrix)
+function DCT_CWCinv(::Type{DCT_5}, C::Matrix{T}, W::Diagonal{T}) where T
+    return Diagonal(T(4 / (2 * size(C, 1) - 1)) * [T(0.5);ones(T, size(C, 2) - 1)])
 end
 
 # DCT-7 parameters (period length w and phase shifts k0 and r0)
-function DCTparams(::Type{T}, ::Type{DCT_7}, R::Int) where T
+function DCT_DST_params(::Type{T}, ::Type{DCT_7}, R::Int) where T
     w = 2 * R - 1
     k0 = T(0.5)
     r0 = zero(T)
@@ -685,7 +756,7 @@ end
 
 # Compute (C' * W * C)^-1 for the DCT-7 (C is the DCT basis and W is the weight matrix)
 function DCT_CWCinv(::Type{DCT_7}, C::Matrix{T}, W::Diagonal{T}) where T
-    return Diagonal(T(4 / (2 * size(C, 1) - 1)) * [ones(T, size(C, 2) - 1);T(0.5)])
+    return Diagonal(T(4 / (2 * size(C, 1) - 1)) * ones(T, size(C, 2)))
 end
 
 ###### Utilities
