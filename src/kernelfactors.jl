@@ -582,48 +582,65 @@ iirg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, emit_warning) where {T} =
 struct DCT_1{T} <: DCTFilter{T}
     basis::Matrix{T}
     coefficients::Vector{T}
+    iscopy::Bool
 end
+Base.typename(::DCT_1{T}) where {T} = "DCT-1{$T}"
 struct DCT_3{T} <: DCTFilter{T}
     basis::Matrix{T}
     coefficients::Vector{T}
+    iscopy::Bool
 end
+Base.typename(::DCT_3{T}) where {T} = "DCT-3{$T}"
 struct DCT_5{T} <: DCTFilter{T}
     basis::Matrix{T}
     coefficients::Vector{T}
+    iscopy::Bool
 end
+Base.typename(::DCT_5{T}) where {T} = "DCT-5{$T}"
 struct DCT_7{T} <: DCTFilter{T}
     basis::Matrix{T}
     coefficients::Vector{T}
+    iscopy::Bool
 end
+Base.typename(::DCT_7{T}) where {T} = "DCT-7{$T}"
 
 # only the DCT types with no spatial phase shift
 DCTtypes = Union{DCT_1, DCT_3, DCT_5, DCT_7}
 Base.vec(kernel::DCTtypes) = kernel
 Base.ndims(kernel::DCTtypes) = 1
 Base.ndims(::Type{T}) where {T <: DCTtypes} = 1
-Base.axes1(kernel::DCTtypes) = 0:0
+function Base.axes1(kernel::DCTtypes)
+    R = size(kernel.basis, 1)
+    return 0:(R - 1)
+end
 Base.axes(kernel::DCTtypes) = (Base.axes1(kernel), )
 Base.isempty(kernel::DCTtypes) = false
+Base.length(kernel::DCTtypes) = length(Base.axes1(kernel))
 
 iterdims(inds::Indices{1}, kern::DCTtypes) = (), inds[1], ()
 _reshape(kern::DCTtypes, ::Val{1}) = kern
 
-approxorder(d::DCTtypes) = size(d.basis, 2)
-@inline function Base.show(io::IO, mime::MIME"text/plain", d::DCTtypes)
-    halfh = d.basis * d.coefficients
-    h = centered(vcat(view(halfh, lastindex(halfh):-1:2), halfh))
-    show(io, mime, h)
+@inline function Base.show(io::IO, ::MIME"text/plain", kernel::DCTtypes)
+    R, K = size(kernel.basis)
+    kernel.iscopy && return print(io, "$(Base.typename(kernel)) copy kernel with eltype $(eltype(kernel)), indices -$(R - 1):$(R - 1) and approximation order $(K):\n")
+    halfh = kernel.basis * kernel.coefficients
+    # h = centered(vcat(view(halfh, lastindex(halfh):-1:2), halfh))
+    # use of indices to display the filter window radius but might be confusing as getindex is not defined for DCTtypes
+    print(io, "$(Base.typename(kernel)) kernel with eltype $(eltype(kernel)), indices -$(R - 1):$(R - 1) and approximation order $(K):\n")
+    Base.print_array(io, halfh)
 end
 
 """
-    DCTGaussian([T], σ; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3)
+    DCTGaussian([T], σ; R::Int = 3 * ceil(Int, σ) + 1, K::Int = 3, emit_warning::Bool = true)
 
-Defines a kernel for one-dimensional discrete cosine transform 7 (DCT-7) 
-approximation to a Gaussian of standard deviation `σ` which preserves
-the first 2 moments. `R` is the filter window radius and `K` is the
-approximation order. `σ` may either be a single real number or a tuple
-of numbers; in the latter case, a tuple of such filters will be created,
-each for filtering a different dimension of an array.
+Defines a kernel for one-dimensional discrete cosine transform 7 (DCT-7) approximation to a 
+Gaussian of standard deviation `σ` which preserves the 0th and 2nd moments. `R` is 
+the filter window radius (meaning that the kernel is defined on `-(R - 1):(R - 1)`) 
+and `K` is the approximation order. The default filter radius is large to provide a 
+good approximation but (neglecting the 2 first filtered coefficients) only `K` 
+affect the computation time. `σ` may either be a single real number or a tuple of numbers;
+in the latter case, a tuple of such filters will be created, each for filtering 
+a different dimension of an array.
 
 Optionally specify the type `T` for the filter coefficients; if not
 supplied, it will match `σ` (unless `σ` is not floating-point, in
@@ -632,21 +649,31 @@ which case `Float64` will be chosen).
 # Citation
 
 K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for dct-based constant-time 
-gaussian filter with moment preservation". IEEE international conference on acoustics,
+gaussian filter with moment preservation." IEEE international conference on acoustics,
 speech and signal processing (ICASSP) 1498-1502 (2018).
+
+See also: [`KernelFactors.DCTcoeff`](@ref).
 """
-function DCTGaussian(::Type{T}, σ::Real; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3) where T
+function DCTGaussian(::Type{T}, σ::Real; R::Int = 3 * ceil(Int, σ) + 1, K::Int = 3, emit_warning::Bool = true) where T
+    if emit_warning && σ < 1 && σ != 0
+        # In fact doing the simulation it appears that the RMSE is smaller with DCT-5 for σ ≤ 1.
+        # Yet, although the 0th and 2nd moments are matched the 4th is largely off. Consider using
+        # DCTcoeff(DCT_5, h, ((0, one(T)), (2, T(σ ^ 2)), (4, T(3 * σ ^ 4))); K = K)
+        @warn("σ is too small for accuracy")
+    elseif σ == 0 # a copy kernel
+        return DCT_7(Matrix{T}(undef, R, K), Vector{T}(undef, K), true)
+    end
     h = OffsetArray([exp(-x ^ 2 / T(2 * σ ^ 2)) for x in 0:(R - 1)], 0:(R - 1))
     h ./= h[0] + 2 * sum(view(h, 1:(R - 1)))
     μ = ((0, one(T)), (2, T(σ ^ 2)))
     return DCTcoeff(DCT_7, h, μ; K = K)
 end
-DCTGaussian(σ::Real; R::Int = (6 * ceil(Int, σ) + 1) >> 1, K::Int = 3) = DCTGaussian(dctgt(σ), σ; R = R, K = K)
+DCTGaussian(σ::Real; R::Int = 3 * ceil(Int, σ) + 1, K::Int = 3, emit_warning::Bool = true) = DCTGaussian(dctgt(σ), σ; R = R, K = K, emit_warning = emit_warning)
 
-function DCTGaussian(::Type{T}, σs::NTuple{N, Real}; R::NTuple{N, Int} = ntuple(d -> (6 * ceil(Int, σs[d]) + 1) >> 1, Val(N)), K::Int = 3) where {T, N}
-    dctg(T, (), σs, tail(ntuple(d -> true, Val(N))), R, K)
+function DCTGaussian(::Type{T}, σs::NTuple{N, Real}; R::NTuple{N, Int} = ntuple(d -> 3 * ceil(Int, σs[d]) + 1, Val(N)), K::Int = 3, emit_warning::Bool = true) where {T, N}
+    dctg(T, (), σs, tail(ntuple(d -> true, Val(N))), R, K, emit_warning)
 end
-DCTGaussian(σs::Tuple; R::Tuple = map(s -> (6 * ceil(Int, s) + 1) >> 1, σs), K::Int = 3) = DCTGaussian(dctgt(σs), σs; R = R, K = K)
+DCTGaussian(σs::Tuple; R::Tuple = map(s -> 3 * ceil(Int, s) + 1, σs), K::Int = 3, emit_warning::Bool = true) = DCTGaussian(dctgt(σs), σs; R = R, K = K, emit_warning = emit_warning)
 
 DCTGaussian(σs::AbstractVector; kwargs...) = DCTGaussian((σs...,); kwargs...)
 DCTGaussian(::Type{T}, σs::AbstractVector; kwargs...) where {T} = DCTGaussian(T, (σs...,); kwargs...)
@@ -655,26 +682,55 @@ dctgt(σ::AbstractFloat) = typeof(σ)
 dctgt(σ::Real) = Float64
 dctgt(σs::Tuple) = promote_type(map(dctgt, σs)...)
 
-@inline function dctg(::Type{T}, pre, σs, post, R, K) where T
+@inline function dctg(::Type{T}, pre, σs, post, R, K, emit_warning) where T
     kern = ReshapedOneD(pre, DCTGaussian(T, σs[1]; R = R[1], K = K), post)
-    (kern, dctg(T, (pre..., post[1]), tail(σs), tail(post), tail(R), K)...)
+    (kern, dctg(T, (pre..., post[1]), tail(σs), tail(post), tail(R), K, emit_warning)...)
 end
-dctg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, R, K) where {T} =
-    (ReshapedOneD(pre, DCTGaussian(T, σs[1]; R = R[1], K = K), ()),)
+dctg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, R, K, emit_warning) where {T} =
+    (ReshapedOneD(pre, DCTGaussian(T, σs[1]; R = R[1], K = K, emit_warning = emit_warning), ()),)
 
-# From a kernel h and a set of moments μ, compute the DCT coefficients where the DCT type is given by D.
-# the type of the kernel and of the moments is used to determine the type of the coefficients.
-# Due to the symmetry of the DCT only the positive part of the kernel is used.
-function DCTcoeff(::Type{D}, h::OffsetVector{T}, μ::NTuple{M, Tuple{Int, T}}; K::Int = 3) where {D <: DCTFilter, T, M}
+"""
+    DCTcoeff(D, h, [μ]; K::Int = 3)
+
+From an even kernel `h` construct an order `K` discrete cosine transform (DCT) 
+approximation used for fast reccursive filtering. The DCT type is given by `D`.
+Only DCT types with no spatial phase shift (DCT-1/3/5/7) are supported. Use 
+KernelFactors.DCT_7 for exemple for a DCT-7.
+
+Optionally specify the a set of moments `μ` to be matched as a NTuple of 
+Tuple{Int, T <: Real}. For exemple, use `((0, 1), )` to force the 0th moment 
+(the sum) of the kernel to be 1. By default no moment constraints are imposed 
+and the output is simply the best approximation in the least square sens.
+
+`h` might be an AbstractVector in which case only the second half part is used 
+due to the even symmetry assumption or a centered OffsetVector for which  the 
+positive part is used.
+
+The filter type will be matching the eltype of `h`.
+
+# Citation
+
+K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for dct-based constant-time 
+gaussian filter with moment preservation." IEEE international conference on acoustics,
+speech and signal processing (ICASSP) 1498-1502 (2018).
+
+Y. Kanetaka, H. Takagi, Y. Maeda and N. Fukushima, "Slidingconv: Domain-specific 
+description of sliding discrete cosine transform convolution for halide." IEEE Access, 
+12, 7563-7583 (2023).
+
+See also: [`KernelFactors.DCTGaussian`](@ref).
+"""
+function DCTcoeff(::Type{D}, h::OffsetVector{T}, μ::NTuple{M, Tuple{Int, Tu}} = (()); K::Int = 3) where {D <: DCTFilter, T, M, Tu <: Real}
     @assert checkindex(Bool, eachindex(h), 0) "The kernel ´h´ must be centered"
-    firstindex(h) != 0 && DCTcoeff(D, OffsetArray(view(h, 0:lastindex(h)), 0:lastindex(h)), μ; K = K)
+    firstindex(h) != 0 && return DCTcoeff(D, OffsetArray(view(h, 0:lastindex(h)), 0:lastindex(h)), μ; K = K)
     R = length(h)
+    @assert K <= R "`K` must be ≤ $(R)"
     W = Diagonal([T(0.5);ones(T, R - 1)]) # weight matrix for DCT symmetry
     C = DCTbasis(T, D, R, K) # DCT basis
     A = DCT_CWCinv(D, C, W) # A =  inv(C' * W * C)
     B = C' * W
     hls = A * B * OffsetArrays.no_offset_view(h) # least square solution without moment constraints
-    M == 0 && return D(C, hls) # no moment constraints
+    M == 0 && return D(C, hls, false) # no moment constraints
     P = zeros(Int, R, M)
     for m = 1:M
         for r = 1:R
@@ -687,11 +743,11 @@ function DCTcoeff(::Type{D}, h::OffsetVector{T}, μ::NTuple{M, Tuple{Int, T}}; K
         @inbounds Uhls[m] -= 0.5 * μ[m][2]
     end
     Sinv = inv(U' * A * U)
-    return D(C, hls - A * U * Sinv * Uhls)
+    return D(C, hls - A * U * Sinv * Uhls, false)
 end
-function DCTcoeff(::Type{D}, h::AbstractVector{T}, μ::NTuple{M, Tuple{Int, T}}; K::Int = 3) where {D <: DCTFilter, T, M}
+function DCTcoeff(::Type{D}, h::AbstractVector{T}, μ::NTuple{M, Tuple{Int, Tu}} = (()); K::Int = 3) where {D <: DCTFilter, T, M, Tu <: Real}
     R = 1 + length(h) >> 1
-    return DCTcoeff(D, OffsetArray(view(h, R:length(h)), 0:R), μ; K = K)
+    return DCTcoeff(D, OffsetArray(view(h, R:lastindex(h)), 0:(R - 1)), μ; K = K)
 end
 
 # Given the filter window radius and the approximation order K 
@@ -730,7 +786,7 @@ end
 
 # Compute (C' * W * C)^-1 for the DCT-3 (C is the DCT basis and W is the weight matrix)
 function DCT_CWCinv(::Type{DCT_3}, C::Matrix{T}, W::Diagonal{T}) where T
-    return Diagonal(T(4 / (2 * size(C, 1))) * ones(T, size(C, 2)))
+    return T(4 / (2 * size(C, 1))) * I(size(C, 2))
 end
 
 # DCT-5 parameters (period length w and phase shifts k0 and r0)
@@ -756,7 +812,7 @@ end
 
 # Compute (C' * W * C)^-1 for the DCT-7 (C is the DCT basis and W is the weight matrix)
 function DCT_CWCinv(::Type{DCT_7}, C::Matrix{T}, W::Diagonal{T}) where T
-    return Diagonal(T(4 / (2 * size(C, 1) - 1)) * ones(T, size(C, 2)))
+    return T(4 / (2 * size(C, 1) - 1)) * I(size(C, 2))
 end
 
 ###### Utilities

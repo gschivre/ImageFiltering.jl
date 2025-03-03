@@ -900,6 +900,31 @@ function imfilter!(r::AbstractResource{IIR},
     _imfilter_inplace_tuple!(r, out, img, kernel, CartesianIndices(()), inds, CartesianIndices(tail(inds)), border)
 end
 
+### DCT/DST recursive filtering
+# Y. Kanetaka, H. Takagi, Y. Maeda and N. Fukushima, "Slidingconv: Domain-specific 
+# description of sliding discrete cosine transform convolution for halide." IEEE Access, 
+# 12, 7563-7583 (2023).
+#
+# K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for dct-based constant-time 
+# gaussian filter with moment preservation". IEEE international conference on acoustics,
+# speech and signal processing (ICASSP) 1498-1502 (2018).
+#
+# K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with sliding 
+# DCT/DST-5 and dual-domain error minimization." ITE Transactions on Media Technology and 
+# Applications 3(1), 12-21 (2015).
+
+# Note this is safe for inplace use, i.e., out === img
+
+function imfilter!(r::AbstractResource{DCT_DST},
+    out::AbstractArray{S, N},
+    img::AbstractArray{T, N},
+    kernel::Tuple{K, Vararg{K}},
+    border::BorderSpec) where {S, T, N, K <: Union{DCTFilter, DSTFilter}}
+    length(kernel) <= N || throw(DimensionMismatch("cannot have more kernels than dimensions"))
+    inds = axes(img)
+    _imfilter_inplace_tuple!(r, out, img, kernel, CartesianIndices(()), inds, CartesianIndices(tail(inds)), border)
+end
+
 """
     imfilter!(r::AbstractResource, imgfilt, img, kernel::Tuple{TriggsSdika...}, border)
     imfilter!(r::AbstractResource, imgfilt, img, kernel::TriggsSdika, dim::Integer, border)
@@ -927,12 +952,62 @@ function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, 
     Rend = CartesianIndices(inds[dim+1:end])
     _imfilter_dim!(r, out, img, kernel, Rbegin, inds[dim], Rend, border)
 end
-function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::TriggsSdika, dim::Integer, border::AbstractString)
+
+"""
+    imfilter!(r::AbstractResource, imgfilt, img, kernel::Tuple{DCTFilter...}, border)
+    imfilter!(r::AbstractResource, imgfilt, img, kernel::DCTFilter, dim::Integer, border)
+
+Filter an array `img` with a discrete cosine transform (DCT) even
+`kernel`, storing the result in `imgfilt`. Unlike the `FIR` and
+`FFT` algorithms, this version is safe for inplace operations, i.e.,
+`imgfilt` can be the same array as `img`.
+
+Either specify one kernel per dimension (as a tuple), or a particular
+dimension `dim` along which to filter. If you exhaust `kernel`s before
+you run out of array dimensions, the remaining dimension(s) will not
+be filtered.
+
+See also: [`imfilter`](@ref), [`KernelFactors.DCTGaussian`](@ref), [`KernelFactors.DCTcoeff`](@ref).
+"""
+function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::DCTFilter, dim::Integer, border::BorderSpec)
+    inds = axes(img)
+    # This next part is not type-stable, which is why _imfilter_dim! has a @noinline
+    Rbegin = CartesianIndices(inds[1:dim-1])
+    Rend = CartesianIndices(inds[dim+1:end])
+    _imfilter_dim!(r, out, img, kernel, Rbegin, inds[dim], Rend, border)
+end
+
+"""
+    imfilter!(r::AbstractResource, imgfilt, img, kernel::Tuple{DSTFilter...}, border)
+    imfilter!(r::AbstractResource, imgfilt, img, kernel::DSTFilter, dim::Integer, border)
+
+Filter an array `img` with a discrete sine transform (DST) odd
+`kernel`, storing the result in `imgfilt`. Unlike the `FIR` and
+`FFT` algorithms, this version is safe for inplace operations, i.e.,
+`imgfilt` can be the same array as `img`.
+
+Either specify one kernel per dimension (as a tuple), or a particular
+dimension `dim` along which to filter. If you exhaust `kernel`s before
+you run out of array dimensions, the remaining dimension(s) will not
+be filtered.
+
+See also: [`imfilter`](@ref), [`KernelFactors.DSTcoeff`](@ref).
+"""
+function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::DSTFilter, dim::Integer, border::BorderSpec)
+    inds = axes(img)
+    # This next part is not type-stable, which is why _imfilter_dim! has a @noinline
+    Rbegin = CartesianIndices(inds[1:dim-1])
+    Rend = CartesianIndices(inds[dim+1:end])
+    _imfilter_dim!(r, out, img, kernel, Rbegin, inds[dim], Rend, border)
+end
+
+# Idem for TriggsSdika, DCTFilter and DSTFilter
+function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::K, dim::Integer, border::AbstractString) where K <: Union{TriggsSdika, DCTFilter, DSTFilter}
     imfilter!(r, out, img, kernel, dim, Pad(Symbol(border)))
 end
 
 
-function imfilter!(r::AbstractResource, out::AbstractArray, A::AbstractVector, kern::TriggsSdika, border::NoPad, inds::Indices=axes(out))
+function imfilter!(r::AbstractResource, out::AbstractArray, A::AbstractVector, kern::K, border::NoPad, inds::Indices=axes(out)) where K <: Union{TriggsSdika, DCTFilter, DSTFilter}
     indspre, ind, indspost = iterdims(inds, kern)
     _imfilter_dim!(r, out, A, kern, CartesianIndices(indspre), ind, CartesianIndices(indspost), border[])
 end
@@ -1093,12 +1168,12 @@ end
 
 ### NA boundary conditions
 
-function imfilter_na_inseparable!(r, out::AbstractArray{T}, img, naflag, kernel::Tuple{Vararg{AnyIIR}}) where {T}
+function imfilter_na_inseparable!(r, out::AbstractArray{T}, img, naflag, kernel::Tuple{Vararg{K}}) where {T, K <: Union{AnyIIR, AnyDCT_DST}}
     fc, fn = Fill(zero(T)), Fill(zero(eltype(T)))  # color, numeric
     copyto!(out, img)
     out[naflag] .= zero(T)
     validpixels = copyto!(similar(Array{eltype(T)}, axes(img)), mappedarray(!, naflag))
-    # TriggsSdika is safe for inplace operations
+    # TriggsSdika and DCT/DST are safe for inplace operations
     imfilter!(r, out, out, kernel, fc)
     imfilter!(r, validpixels, validpixels, kernel, fn)
     for I in eachindex(out)
@@ -1254,6 +1329,7 @@ iscopy(kernel::AbstractArray) = all(x -> x == 0:0, axes(kernel)) && first(kernel
 iscopy(kernel::Laplacian) = false
 iscopy(kernel::TriggsSdika) = all(x -> x == 0, kernel.a) && all(x -> x == 0, kernel.b) && kernel.scale == 1
 iscopy(kernel::ReshapedOneD) = iscopy(kernel.data)
+iscopy(kernel::AnyDCT_DST) = kernel.iscopy
 
 kernelconv(kernel) = kernel
 function kernelconv(k1, k2, kernels...)
