@@ -11,12 +11,15 @@ supported:
   - `bickley`
   - `gaussian`
   - `IIRGaussian` (approximate gaussian filtering, fast even for large σ)
+  - `DCTGaussian` (approximate gaussian filtering in constant time per pixel, fast even for large σ)
+  - `SlidingDCT` (constant-time approximation of an arbitrary even kernel)
 
 See also: [`Kernel`](@ref).
 """
 module KernelFactors
 
 using StaticArrays, OffsetArrays
+using OffsetArrays: IdentityUnitRange
 using ..ImageFiltering: centered, dummyind
 import ..ImageFiltering: _reshape, _vec, nextendeddims
 using Base: tail, Indices, @pure, checkbounds_indices, throw_boundserror, @propagate_inbounds
@@ -568,6 +571,268 @@ end
 iirg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, emit_warning) where {T} =
     (ReshapedOneD(pre, IIRGaussian(T, σs[1]; emit_warning=emit_warning), ()),)
 
+#### Sliding DCT
+
+"""
+    SlidingDCT{T,K,DC} <: AbstractVector{T}
+
+A symmetric kernel with axes `-N:N` that is a short sum of cosines,
+
+    h[r] = c₀ + Σₖ cₖ cos(ωₖ r)    for -N ≤ r ≤ N,
+
+where the constant term `c₀` is only present if `DC` is `true`, and `K` is the
+number of (non-constant) cosine terms. Filtering with such a kernel can be
+performed with a sliding (recursive) discrete cosine transform whose cost per
+pixel is `O(K)` regardless of the kernel width `2N+1`.
+
+A `SlidingDCT` is a genuine finite-support kernel: it can be indexed like any
+other centered kernel, and it can be used anywhere an `AbstractVector` kernel
+is accepted. `imfilter` automatically uses the constant-time algorithm when it
+encounters such a kernel.
+
+!!! note
+    As with recursive (IIR) filters, a non-finite value (`NaN` or `Inf`) in the input
+    contaminates the rest of the line being filtered, rather than only its
+    neighborhood as with direct (FIR) filtering. Use the `NA()` border to filter
+    images with missing values.
+
+Construct one with [`KernelFactors.DCTGaussian`](@ref) or by fitting an arbitrary
+even kernel with `SlidingDCT(h; K, kind, moments)`.
+"""
+struct SlidingDCT{T,K,DC} <: AbstractVector{T}
+    N::Int
+    c::SVector{K,T}   # coefficients of the cosine terms
+    ω::SVector{K,T}   # angular frequencies of the cosine terms (all nonzero)
+    c0::T             # coefficient of the constant (DC) term, zero unless DC
+
+    function SlidingDCT{T,K,DC}(N::Integer, c, ω, c0) where {T,K,DC}
+        N >= 0 || throw(ArgumentError("the kernel radius `N` must be non-negative, got $N"))
+        DC || iszero(c0) || throw(ArgumentError("a nonzero DC coefficient requires `DC = true`"))
+        all(!iszero, ω) || throw(ArgumentError("the DC term must be specified via `c0`, not as a zero frequency"))
+        new{T,K,DC}(N, c, ω, c0)
+    end
+end
+SlidingDCT(N::Integer, c::SVector{K,T}, ω::SVector{K,T}, c0::T, DC::Bool) where {T,K} = SlidingDCT{T,K,DC}(N, c, ω, c0)
+Base.convert(::Type{SlidingDCT{T}}, k::SlidingDCT{T}) where {T} = k
+Base.convert(::Type{SlidingDCT{T}}, k::SlidingDCT{S,K,DC}) where {T,S,K,DC} =
+    SlidingDCT{T,K,DC}(k.N, SVector{K,T}(k.c), SVector{K,T}(k.ω), T(k.c0))
+
+_reshape(kernel::SlidingDCT, ::Val{1}) = kernel
+_reshape(kernel::SlidingDCT, ::Val{N}) where {N} = ReshapedOneD{N,0}(kernel)
+
+Base.axes(kernel::SlidingDCT) = (IdentityUnitRange(-kernel.N:kernel.N),)
+Base.size(kernel::SlidingDCT) = (2 * kernel.N + 1,)
+@inline function Base.getindex(kernel::SlidingDCT{T}, i::Int) where {T}
+    @boundscheck checkbounds(kernel, i)
+    v = kernel.c0
+    for k in eachindex(kernel.c)
+        v += kernel.c[k] * cos(kernel.ω[k] * i)
+    end
+    return v
+end
+
+"""
+    SlidingDCT(h; K = 3, kind = 7, moments = K >= 2 ? (0, 2) : (0,))
+
+Approximate the even, centered kernel `h` (with axes `-N:N`) by a sum of `K`
+discrete cosine transform (DCT) basis functions, so that filtering with it can
+be performed in constant time per pixel, independent of `N`.
+
+The coefficients are the least-squares fit of `h` subject to exactly preserving
+the moments `Σᵣ rᵐ h[r]` for each order `m` listed in `moments`. The default
+preserves the sum (0th moment) and, if `K ≥ 2`, the second moment (the variance
+of a normalized kernel); pass `moments = ()` for an unconstrained least-squares fit.
+There cannot be more moments than terms.
+
+`kind` selects the DCT basis, i.e., the frequencies `ωₖ`, among the DCT types
+without spatial phase shift:
+
+| `kind` | `ωₖ`, `k = 0, …, K-1` |
+|:------:|:-----------------------|
+| `1`    | `πk/N`                 |
+| `3`    | `π(2k+1)/(2N+2)`       |
+| `5`    | `2πk/(2N+1)`           |
+| `7`    | `π(2k+1)/(2N+1)`       |
+
+DCT-3 and DCT-7 (the default) do not contain a constant term and are usually
+the most accurate for a given `K`.
+
+The element type of the result matches `float(eltype(h))`.
+
+# Citation
+
+K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with
+sliding DCT/DST-5 and dual-domain error minimization", ITE Transactions on
+Media Technology and Applications 3: 12-21 (2015).
+
+K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for DCT-based
+constant-time Gaussian filter with moment preservation", IEEE International
+Conference on Acoustics, Speech and Signal Processing (ICASSP), 1498-1502 (2018).
+
+See also: [`KernelFactors.DCTGaussian`](@ref).
+"""
+function SlidingDCT(h::AbstractVector; K::Integer = 3, kind::Integer = 7, moments = K >= 2 ? (0, 2) : (0,))
+    ax = axes(h, 1)
+    N = last(ax)
+    first(ax) == -N || throw(ArgumentError("the kernel must have axes `-N:N`, got $ax (use `centered`)"))
+    T = float(eltype(h))
+    all(r -> h[r] ≈ h[-r], 1:N) || throw(ArgumentError("the kernel must be even, i.e., h[r] == h[-r]"))
+    μ = map(m -> (m, sum(r -> T(r)^m * h[r], ax)), Tuple(moments))
+    return dctfit(T, r -> h[r], N, K, kind, μ)
+end
+
+# Fit `target(r)` for `r ∈ -N:N` by `K` cosine terms of the DCT type `kind`,
+# subject to Σᵣ rᵐ ĥ(r) = μₘ for each `(m, μₘ)` in `μ`.
+function dctfit(::Type{T}, target, N::Integer, K::Integer, kind::Integer, μ) where {T}
+    kind ∈ (1, 3, 5, 7) || throw(ArgumentError("`kind` must be one of 1, 3, 5 or 7, got $kind"))
+    K >= 1 || throw(ArgumentError("`K` must be at least 1, got $K"))
+    M = length(μ)
+    # h[0:N] determines an even kernel, so at most N+1 cosines are linearly independent
+    K <= N + 1 || throw(ArgumentError("`K` must not exceed `N + 1` = $(N + 1); increase the kernel radius"))
+    M <= K || throw(ArgumentError("cannot preserve $M moments with only `K` = $K terms"))
+    Tf = promote_type(T, Float64)
+    ω = dctfrequencies(Tf, kind, N, K)
+    rs = -N:N
+    C = [cos(ωk * r) for r in rs, ωk in ω]
+    h = Tf[target(r) for r in rs]
+    if M == 0
+        c = C \ h
+    else
+        # Lagrange multipliers; each moment row is scaled by N^m for conditioning
+        s = [Tf(max(N, 1))^m for (m, _) in μ]
+        U = [Tf(r)^m / s[i] for (i, (m, _)) in enumerate(μ), r in rs] * C
+        rhs = [2 * (C' * h); [Tf(μm) / s[i] for (i, (_, μm)) in enumerate(μ)]]
+        c = ([2 * (C' * C) U'; U zeros(Tf, M, M)] \ rhs)[1:K]
+    end
+    DC = iszero(first(ω))
+    c0 = DC ? T(c[1]) : zero(T)
+    idx = DC ? (2:K) : (1:K)
+    Kosc = length(idx)
+    return SlidingDCT(N, SVector{Kosc,T}(c[idx]), SVector{Kosc,T}(ω[idx]), c0, DC)
+end
+
+function dctfrequencies(::Type{T}, kind::Integer, N::Integer, K::Integer) where {T}
+    kind == 1 && return [T(π) * k / N for k in 0:K-1]
+    kind == 3 && return [T(π) * (2k + 1) / (2N + 2) for k in 0:K-1]
+    kind == 5 && return [2 * T(π) * k / (2N + 1) for k in 0:K-1]
+    return [T(π) * (2k + 1) / (2N + 1) for k in 0:K-1]
+end
+
+# Initial guess for the radius of a DCT approximation of a Gaussian with K cosine
+# terms, from the dual-domain error minimization of Sugimoto & Kamata (2015): the
+# spatial truncation error Es(R) = erfc(ϕ) decreases with R while the frequency
+# truncation error Ef(K, R) ≈ erfc(ψ) increases, with ϕ = (2R+1)/(2σ) and
+# ψ = πσ(2K+1)/(2R+1); their sum is unimodal and we find the zero of its derivative
+# by bisection.
+function dctgaussian_radius(σ::Real, K::Integer)
+    function dE(R)
+        ϕ = (2R + 1) / (2σ)
+        ψ = π * σ * (2K + 1) / (2R + 1)
+        return (4ψ^2 - 1) * sqrt(π) * σ * (2K + 1) / (R^2 + R + 1/4) * exp(-ψ^2) - 4ϕ^2 / (sqrt(π) * σ) * exp(-ϕ^2)
+    end
+    lo, hi = max(floor(Int, σ), 1), ceil(Int, (K + 3) * σ)
+    while hi > lo + 1
+        mid = (lo + hi) >> 1
+        dE(mid) < 0 ? (lo = mid) : (hi = mid)
+    end
+    return abs(dE(lo)) <= abs(dE(hi)) ? lo : hi
+end
+
+# Starting from N, descend the exact L2 error `err(N)` of the fitted kernel
+function refine_radius(err, N::Integer, Nmin::Integer)
+    N = max(N, Nmin)
+    e = err(N)
+    for step in (1, -1)
+        while N + step >= Nmin
+            e2 = err(N + step)
+            e2 < e || break
+            N, e = N + step, e2
+        end
+    end
+    return N
+end
+
+"""
+    DCTGaussian([T], σ; K = 3, N, kind = 7, emit_warning = true)
+
+Construct a [`KernelFactors.SlidingDCT`](@ref) approximation of a Gaussian of
+standard deviation `σ`. Filtering with it costs `O(K)` operations per pixel,
+independently of `σ`, which makes it the fastest choice for large `σ`.
+
+The kernel is the least-squares approximation, on `-N:N`, of the sampled Gaussian
+by `K` DCT basis functions, constrained to preserve the sum (so that constant
+images are unchanged) and, if `K ≥ 2`, the variance of the Gaussian. Increasing `K` improves
+the accuracy at the cost of speed: the maximal error relative to the peak of the
+kernel is about `5e-2`, `4e-3`, `1e-3`, `2e-4` and `4e-5` for `K = 2, …, 6`.
+Unless specified, the radius `N` minimizes the L2 (energy) error of the kernel with
+respect to the untruncated Gaussian, which balances the truncation of the kernel in
+space and in frequency ("dual-domain error minimization", Sugimoto & Kamata 2015).
+See [`KernelFactors.SlidingDCT`](@ref) for the meaning of `kind`.
+
+`σ` may either be a single real number or a tuple of numbers; in the latter case,
+a tuple of such filters will be created, each for filtering a different dimension
+of an array.
+
+Optionally specify the type `T` for the filter coefficients; if not
+supplied, it will match `σ` (unless `σ` is not floating-point, in
+which case `Float64` will be chosen).
+
+# Examples
+
+```julia
+imgf = imfilter(img, KernelFactors.DCTGaussian((10, 10)))
+```
+
+# Citation
+
+K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with
+sliding DCT/DST-5 and dual-domain error minimization", ITE Transactions on
+Media Technology and Applications 3: 12-21 (2015).
+
+K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for DCT-based
+constant-time Gaussian filter with moment preservation", IEEE International
+Conference on Acoustics, Speech and Signal Processing (ICASSP), 1498-1502 (2018).
+
+See also: [`KernelFactors.IIRGaussian`](@ref), [`KernelFactors.gaussian`](@ref).
+"""
+function DCTGaussian(::Type{T}, σ::Real; K::Integer = 3, N::Union{Integer,Nothing} = nothing,
+                     kind::Integer = 7, emit_warning::Bool = true) where {T}
+    σ >= 0 || throw(ArgumentError("σ must be non-negative, got $σ"))
+    if iszero(σ)
+        return SlidingDCT(0, SVector{0,T}(), SVector{0,T}(), one(T), true)  # the identity kernel
+    end
+    emit_warning && σ < 1 && @warn("σ is too small for accuracy")
+    # The (untruncated) sampled Gaussian and its moments
+    Tf = promote_type(T, Float64)
+    M = max(something(N, 0), ceil(Int, (K + 3) * σ)) + ceil(Int, 10σ)
+    g = OffsetArray([exp(-Tf(r)^2 / (2 * Tf(σ)^2)) for r in -M:M], -M:M)
+    g ./= sum(g)
+    μ2 = sum(r -> Tf(r)^2 * g[r], -M:M)
+    μ = K == 1 ? ((0, one(Tf)),) : ((0, one(Tf)), (2, μ2))
+    fit(N) = dctfit(Tf, r -> g[r], N, K, kind, μ)
+    if N === nothing
+        # Minimize the L2 error, including the truncation outside -N:N
+        Nmin = max(K - 1, 1)  # K ≤ N + 1 is required by the fit
+        gnorm2 = sum(abs2, g)
+        err(n) = (k = fit(n); (sum(r -> abs2(k[r] - g[r]), -n:n) + gnorm2 - sum(r -> abs2(g[r]), -n:n)))
+        N = refine_radius(err, dctgaussian_radius(σ, kind ∈ (1, 5) ? K - 1 : K), Nmin)
+    end
+    return convert(SlidingDCT{T}, fit(N))
+end
+DCTGaussian(σ::Real; kwargs...) = DCTGaussian(iirgt(σ), σ; kwargs...)
+
+function DCTGaussian(::Type{T}, σs::NTuple{D,Real}; N = map(σ -> nothing, σs), kwargs...) where {T,D}
+    Ns = N isa Tuple ? N : ntuple(_ -> N, Val(D))
+    kernelfactors(ntuple(d -> _dctgaussian(T, σs[d], Ns[d]; kwargs...), Val(D)))
+end
+DCTGaussian(σs::Tuple; kwargs...) = DCTGaussian(iirgt(σs), σs; kwargs...)
+
+DCTGaussian(σs::AbstractVector; kwargs...) = DCTGaussian((σs...,); kwargs...)
+DCTGaussian(::Type{T}, σs::AbstractVector; kwargs...) where {T} = DCTGaussian(T, (σs...,); kwargs...)
+
+_dctgaussian(::Type{T}, σ, ::Nothing; kwargs...) where {T} = DCTGaussian(T, σ; kwargs...)
+_dctgaussian(::Type{T}, σ, N::Integer; kwargs...) where {T} = DCTGaussian(T, σ; N = N, kwargs...)
+
 ###### Utilities
 
 """
@@ -608,6 +873,7 @@ if Base.VERSION >= v"1.4.2" && ccall(:jl_generating_output, Cint, ()) == 1
         precompile(gaussian, (T,))
         precompile(gaussian, (T, Int))
         precompile(IIRGaussian, (Tuple{T,T},))
+        precompile(DCTGaussian, (Tuple{T,T},))
     end
 end
 
