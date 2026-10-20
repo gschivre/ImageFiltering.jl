@@ -669,8 +669,17 @@ Base.convert(::Type{SlidingKernel{T}}, k::SlidingDCT{S,K,DC}) where {T,S,K,DC} =
 Base.convert(::Type{SlidingKernel{T}}, k::SlidingDST{S,K}) where {T,S,K} =
     SlidingDST{T,K}(k.N, SVector{K,T}(k.c), SVector{K,T}(k.ω))
 
+# Base's ReshapedArray mis-indexes parents with offset axes on Julia 1.6, so we
+# materialize the (short) kernel when converting a ReshapedOneD to an array
+Base.convert(::Type{AA}, A::ReshapedOneD{T,N,Npre,<:SlidingKernel}) where {AA<:AbstractArray,T,N,Npre} =
+    convert(AA, OffsetArray(reshape([A.data[i] for i in axes(A.data, 1)], map(length, axes(A))), axes(A)))
+
 _reshape(kernel::SlidingKernel, ::Val{1}) = kernel
-_reshape(kernel::SlidingKernel, ::Val{N}) where {N} = ReshapedOneD{N,0}(kernel)
+function _reshape(kernel::SlidingKernel, ::Val{N}) where {N}
+    throw(DimensionMismatch("a $(nameof(typeof(kernel))) is a 1-dimensional kernel and cannot filter a $N-dimensional array; " *
+                            "give one kernel per dimension instead, e.g., `KernelFactors.DCTGaussian((σ, σ))` rather than " *
+                            "`KernelFactors.DCTGaussian(σ)` for a 2-dimensional Gaussian (see also `kernelfactors`)"))
+end
 
 Base.axes(kernel::SlidingKernel) = (IdentityUnitRange(-kernel.N:kernel.N),)
 Base.size(kernel::SlidingKernel) = (2 * kernel.N + 1,)
@@ -889,10 +898,12 @@ respect to the untruncated Gaussian (derivative), which balances the truncation 
 the kernel in space and in frequency ("dual-domain error minimization", Sugimoto &
 Kamata 2015).
 
-`σ` may either be a single real number or a tuple of numbers; in the latter case,
-a tuple of such filters will be created, each for filtering a different dimension
-of an array. Then, `order`, `K`, `N` and `kind` may be given either as a single
-value or as a tuple with one value per dimension.
+`σ` may either be a single real number or a tuple of numbers. A single number gives
+a 1-dimensional kernel, which filters vectors (or is a factor for
+[`kernelfactors`](@ref)); to filter an `N`-dimensional array, give `N` values, e.g.,
+`(σ, σ)` for an image. With a tuple, a tuple of such filters is created, each for
+filtering a different dimension of an array; then, `order`, `K`, `N` and `kind` may
+be given either as a single value or as a tuple with one value per dimension.
 
 Optionally specify the type `T` for the filter coefficients; if not
 supplied, it will match `σ` (unless `σ` is not floating-point, in
@@ -972,9 +983,13 @@ end
 """
     DCTGaussian([T], σ; K = 3, N, kind = 7, emit_warning = true)
 
-Construct a constant-time approximation of a Gaussian of standard deviation `σ`
-(a single number, or a tuple with one value per dimension). This is equivalent to
-`slidinggaussian([T], σ; order = 0, ...)`: see [`KernelFactors.slidinggaussian`](@ref).
+Construct a constant-time approximation of a Gaussian of standard deviation `σ`.
+This is equivalent to `slidinggaussian([T], σ; order = 0, ...)`: see
+[`KernelFactors.slidinggaussian`](@ref).
+
+As for [`KernelFactors.gaussian`](@ref) and [`KernelFactors.IIRGaussian`](@ref), a
+single number `σ` gives a 1-dimensional kernel; to filter an `N`-dimensional array,
+give one value per dimension, e.g., `DCTGaussian((σ, σ))` for an image.
 
 The approximation is much more accurate than [`KernelFactors.IIRGaussian`](@ref),
 for a similar speed: on images, the peak signal-to-noise ratio of the result with

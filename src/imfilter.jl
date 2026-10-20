@@ -1129,8 +1129,10 @@ function imfilter!(r::AbstractResource{DCT},
     end
     nstages = length(kernN)
     nstages == 0 && return copyto!(out, img)
-    # Ping-pong between `out` and a temporary so that the last stage writes to `out`
-    src = Base.mightalias(out, img) ? copy(img) : img
+    # Ping-pong between `out` and a temporary so that the last stage writes to `out`.
+    # For inplace filtering (out === img), the first stage writes to the temporary
+    # when there is an even number of stages; otherwise the input must be copied.
+    src = out === img && isodd(nstages) ? copy(img) : img
     tmp = nstages > 1 ? similar(out) : out
     dst = isodd(nstages) ? out : tmp
     for kern in kernN
@@ -1171,7 +1173,7 @@ See also: [`imfilter`](@ref), [`KernelFactors.slidinggaussian`](@ref).
 function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SlidingKernel, dim::Integer, border::Union{Pad{0},Fill{<:Any,0}})
     1 <= dim <= ndims(img) || throw(ArgumentError("dimension $dim is out of range for an array of dimension $(ndims(img))"))
     axes(out) == axes(img) || throw(DimensionMismatch("output axes $(axes(out)) must match the input axes $(axes(img))"))
-    src = Base.mightalias(out, img) ? copy(img) : img
+    src = out === img ? copy(img) : img   # inplace filtering
     inds = axes(img)
     _imfilter_dct_line!(out, src, kernel, CartesianIndices(inds[1:dim-1]), inds[dim], CartesianIndices(inds[dim+1:end]), border)
 end
@@ -1228,7 +1230,10 @@ end
 # in storage order.
 #
 # `out[Ipre, t, Ipost]` is computed from `A[Ipre - Opre, pidx[t + r], Ipost - Opost]`
-# for -N ≤ r ≤ N, where `pidx[j] == typemin(Int)` stands for `fillvalue`.
+# for -N ≤ r ≤ N, where `pidx[j] == typemin(Int)` stands for `fillvalue`. As for the
+# other algorithms, the callers are responsible for the validity of these indices:
+# `padindex` only returns indices of `A`, and with `NoPad` the input has been
+# checked to cover the output region expanded by the kernel.
 @noinline function _imfilter_dct!(out, A, kernel::Union{SlidingDCT{T,K},SlidingDST{T,K}},
                                   Rpre::CartesianIndices, ind::AbstractUnitRange, Rpost::CartesianIndices,
                                   pidx::AbstractVector{Int}, fillvalue, Opre::CartesianIndex, Opost::CartesianIndex) where {T,K}
@@ -1236,15 +1241,7 @@ end
     N, c, ω, c0 = kernel.N, kernel.c, kernel.ω, KernelFactors.dccoef(kernel)
     DC, f, par = KernelFactors.hasdc(kernel), KernelFactors.basisfunction(kernel), KernelFactors.parity(kernel)
     t0, tend = first(ind), last(ind)
-    # Validate all indices once, which justifies the @inbounds below
-    checkbounds(pidx, t0-N:tend+N)
-    jmin, jmax = extrema(j -> j == typemin(Int) ? first(axes(A, ndims(Rpre) + 1)) : j, view(pidx, t0-N:tend+N))
-    for (Ipre, j, Ipost) in ((first(Rpre), jmin, first(Rpost)), (last(Rpre), jmax, last(Rpost)))
-        checkbounds(out, Ipre, t0, Ipost)
-        checkbounds(out, Ipre, tend, Ipost)
-        checkbounds(A, Ipre - Opre, j, Ipost - Opost)
-    end
-    p = accumfilter(A[first(Rpre) - Opre, jmin, first(Rpost) - Opost], one(T))
+    p = accumfilter(A[first(Rpre) - Opre, pidx[t0], first(Rpost) - Opost], one(T))
     Tz = typeof(p + p)
     fillz = fillvalue === nothing ? zero(Tz) : convert(Tz, fillvalue)
     α = 2 .* cos.(ω)
@@ -1358,7 +1355,7 @@ function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, 
 end
 
 function _imfilter_sum!(f!, out, img, kernel::SeparableSum)
-    src = Base.mightalias(out, img) ? copy(img) : img
+    src = out === img ? copy(img) : img   # inplace filtering: all the terms need the input
     f!(out, src, first(kernel.terms))
     w = first(kernel.weights)
     isone(w) || (out .*= w)

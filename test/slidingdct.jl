@@ -79,6 +79,13 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         @test DCTGaussian((2.0, 5.0); N = 20)[1].data.N == 20
         @test DCTGaussian((2.0, 5.0); K = 5)[1].data == DCTGaussian(2.0; K = 5)
         @test eltype(DCTGaussian(Float32, (2, 5))[1]) == Float32
+        # A 1-d kernel can only filter vectors: n-d arrays need one kernel per dimension
+        @test_throws DimensionMismatch imfilter(rand(5, 6), DCTGaussian(3.0))
+        @test_throws DimensionMismatch imfilter(rand(5, 6), (DCTGaussian(3.0),))
+        @test_throws DimensionMismatch imfilter(rand(5, 6, 7), slidinggaussian(3.0; order = 1))
+        # (forcing FIR, the error comes from the padding, as for `KernelFactors.gaussian(3)`)
+        @test_throws ArgumentError imfilter(rand(5, 6), DCTGaussian(3.0), "reflect", Algorithm.FIR())
+        @test imfilter(rand(5, 6), (ReshapedOneD{2,0}(DCTGaussian(3.0)),)) isa Matrix{Float64}   # explicit is fine
         # σ = 0 is the identity
         k0 = DCTGaussian(0)
         @test axes(k0) == (0:0,) && k0[0] == 1
@@ -181,6 +188,13 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
             img2 = copy(img)
             @test imfilter!(img2, img2, kk, "reflect") === img2
             @test img2 ≈ imfilter(img, firkernel(kk), "reflect", Algorithm.FIR())
+        end
+        img3 = rand(15, 16, 17)
+        k3 = DCTGaussian((2.0, 1.5, 2.5))
+        for kk in (k3, k3[1:2], k3[2:3], k3[2:2])   # odd and even numbers of stages
+            img4 = copy(img3)
+            @test imfilter!(img4, img4, kk, "symmetric") === img4
+            @test img4 ≈ imfilter(img3, firkernel(kk), "symmetric", Algorithm.FIR())
         end
         # Filtering along a single dimension
         out = similar(img)
@@ -402,7 +416,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
             @test err(DCTDoG(σ)) < err(Kernel.DoG(σ)) / 2   # more accurate than the (truncated) dense kernel
             @test err(DCTDoG(σ; K = 5)) < 2e-4
         end
-        @test DCTDoG((2.0, 3.0)).terms[2] == DCTGaussian((2√2, 3√2))
+        @test DCTDoG((2.0, 3.0)).terms[2] == DCTGaussian((2 * √2, 3 * √2))
         @test DCTDoG((2.0, 3.0), (4.0, 5.0)).weights == (true, -1)
     end
 
