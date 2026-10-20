@@ -243,9 +243,9 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
             p3 = psnr(imfilter(img, DCTGaussian((σ, σ)), "replicate"), ref)
             p5 = psnr(imfilter(img, DCTGaussian((σ, σ); K = 5), "replicate"), ref)
             piir = psnr(imfilter(img, KernelFactors.IIRGaussian((σ, σ)), "replicate"), ref)
-            @test p3 > 60
-            @test p5 > 80
-            @test p3 > piir + 5   # substantially more accurate than IIRGaussian
+            @test p3 > 70
+            @test p5 > 95
+            @test p3 > piir + 15   # substantially more accurate than IIRGaussian
         end
         # the input is not modified
         img = rand(20, 20); img0 = copy(img)
@@ -286,7 +286,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         # accuracy with the default parameters, and improvement with K
         for σ in (3.0, 10.0), order in (1, 2)
             ref = sampledderivative(σ, order)
-            @test l2err(slidinggaussian(σ; order = order), ref) < 3e-2
+            @test l2err(slidinggaussian(σ; order = order), ref) < 2e-2
             errs = [l2err(slidinggaussian(σ; order = order, K = K), ref) for K in 3:6]
             @test issorted(errs; rev = true)
         end

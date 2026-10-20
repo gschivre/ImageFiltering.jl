@@ -869,12 +869,20 @@ and the second moment for `order = 0` and `2`, the first and third moments for
 `order = 1` (only the lowest one if `K = 1`). Consequently, constant images are
 unchanged by the Gaussian and the derivatives are exact for polynomials of low degree.
 
-Increasing `K` improves the accuracy at the cost of speed. The defaults, `K = 3`
-for `order` 0 and 1 and `K = 4` for `order = 2`, give a relative L2 error of the
-kernel of about `5e-3`, `1e-2` and `2e-2`, respectively; each additional term
-reduces it by a factor 3 to 10. Even orders use a DCT-7 basis and odd orders a
-DST-5 basis by default (see [`KernelFactors.SlidingDCT`](@ref) and
-[`KernelFactors.SlidingDST`](@ref) for the other choices of `kind`).
+Increasing `K` improves the accuracy at the cost of speed. The defaults are `K = 3`
+for `order` 0 and 1, and `K = 4` for `order = 2`. The relative L2 error of the kernel
+with respect to the untruncated sampled Gaussian (derivative) is at most (for
+`2 ≤ σ ≤ 64`, with the default `kind` and `N`):
+
+| `K`         | 2      | 3      | 4      | 5      | 6      |
+|:-----------:|:------:|:------:|:------:|:------:|:------:|
+| `order = 0` | `5e-2` | `5e-3` | `1.4e-3` | `2.3e-4` | `6e-5` |
+| `order = 1` | `1.3e-1` | `1.7e-2` | `5e-3` | `5.6e-4` | `1.6e-4` |
+| `order = 2` | `2.5e-1` | `1e-1` | `1.8e-2` | `5.3e-3` | `1.2e-3` |
+
+Even orders use a DCT-7 basis and odd orders a DST-5 basis by default (see
+[`KernelFactors.SlidingDCT`](@ref) and [`KernelFactors.SlidingDST`](@ref) for the
+other choices of `kind`).
 
 Unless specified, the radius `N` minimizes the L2 (energy) error of the kernel with
 respect to the untruncated Gaussian (derivative), which balances the truncation of
@@ -969,8 +977,10 @@ Construct a constant-time approximation of a Gaussian of standard deviation `σ`
 `slidinggaussian([T], σ; order = 0, ...)`: see [`KernelFactors.slidinggaussian`](@ref).
 
 The approximation is much more accurate than [`KernelFactors.IIRGaussian`](@ref),
-for a similar speed; the error relative to the peak of the kernel is about `5e-2`,
-`5e-3`, `1e-3`, `2e-4` and `4e-5` for `K = 2, …, 6`.
+for a similar speed: on images, the peak signal-to-noise ratio of the result with
+respect to an exact Gaussian filter is 15 to 30 dB higher with the default `K = 3`
+(for `1 ≤ σ ≤ 64`). The maximal error of the kernel, relative to its peak, is at most
+`6e-2`, `5e-3`, `1.3e-3`, `2e-4` and `6e-5` for `K = 2, …, 6` (for `2 ≤ σ ≤ 64`).
 
 # Examples
 
