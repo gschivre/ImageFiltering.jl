@@ -1092,9 +1092,9 @@ function rightΔu(img, uplus, Ibegin, i, Iend, kernel::TriggsSdika{T,3,l}) where
 end
 
 ### Sliding DCT/DST (constant-time filtering with a SlidingKernel)
-# K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with
-# sliding DCT/DST-5 and dual-domain error minimization". ITE Trans. on Media
-# Technology and Applications 3: 12-21 (2015).
+# K. Sugimoto and S. Kamata, "Efficient Constant-time Gaussian Filtering with Sliding
+# DCT/DST-5 and Dual-domain Error Minimization". ITE Transactions on Media Technology
+# and Applications 3(1): 12-21 (2015). doi:10.3169/mta.3.12
 #
 # For h[r] = c₀ + Σₖ cₖ f(ωₖ r) on -N:N, with f = cos (DCT) or f = sin (DST, c₀ = 0),
 # the output is y(t) = Z₀(t) + Σₖ Zₖ(t) with

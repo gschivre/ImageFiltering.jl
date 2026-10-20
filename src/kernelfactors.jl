@@ -714,9 +714,9 @@ The element type of the result matches `float(eltype(h))`.
 
 # Citation
 
-K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with
-sliding DCT/DST-5 and dual-domain error minimization", ITE Transactions on
-Media Technology and Applications 3: 12-21 (2015).
+K. Sugimoto and S. Kamata, "Efficient Constant-time Gaussian Filtering with Sliding
+DCT/DST-5 and Dual-domain Error Minimization", ITE Transactions on Media Technology
+and Applications 3(1): 12-21 (2015). doi:10.3169/mta.3.12
 
 K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for DCT-based
 constant-time Gaussian filter with moment preservation", IEEE International
@@ -901,9 +901,9 @@ imgx = imfilter(img, KernelFactors.slidinggaussian((3, 3); order = (1, 0)))
 
 # Citation
 
-K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with
-sliding DCT/DST-5 and dual-domain error minimization", ITE Transactions on
-Media Technology and Applications 3: 12-21 (2015).
+K. Sugimoto and S. Kamata, "Efficient Constant-time Gaussian Filtering with Sliding
+DCT/DST-5 and Dual-domain Error Minimization", ITE Transactions on Media Technology
+and Applications 3(1): 12-21 (2015). doi:10.3169/mta.3.12
 
 K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for DCT-based
 constant-time Gaussian filter with moment preservation", IEEE International
