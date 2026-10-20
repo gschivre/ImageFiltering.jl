@@ -12,7 +12,9 @@ supported:
   - `gaussian`
   - `IIRGaussian` (approximate gaussian filtering, fast even for large σ)
   - `DCTGaussian` (approximate gaussian filtering in constant time per pixel, fast even for large σ)
-  - `SlidingDCT` (constant-time approximation of an arbitrary even kernel)
+  - `slidinggaussian` (constant-time gaussian and gaussian derivatives)
+  - `DCTLoG` and `DCTDoG` (constant-time Laplacian and difference of gaussians)
+  - `SlidingDCT` and `SlidingDST` (constant-time approximation of arbitrary even and odd kernels)
 
 See also: [`Kernel`](@ref).
 """
@@ -571,24 +573,22 @@ end
 iirg(::Type{T}, pre, σs::Tuple{Real}, ::Tuple{}, emit_warning) where {T} =
     (ReshapedOneD(pre, IIRGaussian(T, σs[1]; emit_warning=emit_warning), ()),)
 
-#### Sliding DCT
+#### Sliding DCT/DST
 
 """
-    SlidingDCT{T,K,DC} <: AbstractVector{T}
+    SlidingKernel{T} <: AbstractVector{T}
 
-A symmetric kernel with axes `-N:N` that is a short sum of cosines,
+Supertype of the kernels with axes `-N:N` that are short sums of cosines
+([`KernelFactors.SlidingDCT`](@ref), for even kernels) or of sines
+([`KernelFactors.SlidingDST`](@ref), for odd kernels). Filtering with such a
+kernel can be performed with a sliding (recursive) discrete cosine/sine transform,
+at a cost per pixel proportional to the number of terms regardless of the kernel
+width `2N+1`.
 
-    h[r] = c₀ + Σₖ cₖ cos(ωₖ r)    for -N ≤ r ≤ N,
-
-where the constant term `c₀` is only present if `DC` is `true`, and `K` is the
-number of (non-constant) cosine terms. Filtering with such a kernel can be
-performed with a sliding (recursive) discrete cosine transform whose cost per
-pixel is `O(K)` regardless of the kernel width `2N+1`.
-
-A `SlidingDCT` is a genuine finite-support kernel: it can be indexed like any
-other centered kernel, and it can be used anywhere an `AbstractVector` kernel
-is accepted. `imfilter` automatically uses the constant-time algorithm when it
-encounters such a kernel.
+A `SlidingKernel` is a genuine finite-support kernel: it can be indexed like any
+other centered kernel, and it can be used anywhere an `AbstractVector` kernel is
+accepted. `imfilter` automatically uses the constant-time algorithm when all the
+factors of a kernel are `SlidingKernel`s.
 
 !!! note
     As with recursive (IIR) filters, a non-finite value (`NaN` or `Inf`) in the input
@@ -596,10 +596,24 @@ encounters such a kernel.
     neighborhood as with direct (FIR) filtering. Use the `NA()` border to filter
     images with missing values.
 
-Construct one with [`KernelFactors.DCTGaussian`](@ref) or by fitting an arbitrary
-even kernel with `SlidingDCT(h; K, kind, moments)`.
+See also: [`KernelFactors.slidinggaussian`](@ref), [`KernelFactors.DCTGaussian`](@ref).
 """
-struct SlidingDCT{T,K,DC} <: AbstractVector{T}
+abstract type SlidingKernel{T} <: AbstractVector{T} end
+
+"""
+    SlidingDCT{T,K,DC} <: SlidingKernel{T}
+
+An even kernel with axes `-N:N`,
+
+    h[r] = c₀ + Σₖ cₖ cos(ωₖ r)    for -N ≤ r ≤ N,
+
+where the constant term `c₀` is only present if `DC` is `true`, and `K` is the
+number of (non-constant) cosine terms. See [`KernelFactors.SlidingKernel`](@ref).
+
+Construct one with [`KernelFactors.slidinggaussian`](@ref) or by fitting an
+arbitrary even kernel with `SlidingDCT(h; K, kind, moments)`.
+"""
+struct SlidingDCT{T,K,DC} <: SlidingKernel{T}
     N::Int
     c::SVector{K,T}   # coefficients of the cosine terms
     ω::SVector{K,T}   # angular frequencies of the cosine terms (all nonzero)
@@ -613,20 +627,59 @@ struct SlidingDCT{T,K,DC} <: AbstractVector{T}
     end
 end
 SlidingDCT(N::Integer, c::SVector{K,T}, ω::SVector{K,T}, c0::T, DC::Bool) where {T,K} = SlidingDCT{T,K,DC}(N, c, ω, c0)
-Base.convert(::Type{SlidingDCT{T}}, k::SlidingDCT{T}) where {T} = k
-Base.convert(::Type{SlidingDCT{T}}, k::SlidingDCT{S,K,DC}) where {T,S,K,DC} =
+
+"""
+    SlidingDST{T,K} <: SlidingKernel{T}
+
+An odd kernel with axes `-N:N`,
+
+    h[r] = Σₖ cₖ sin(ωₖ r)    for -N ≤ r ≤ N,
+
+with `K` sine terms. See [`KernelFactors.SlidingKernel`](@ref).
+
+Construct one with [`KernelFactors.slidinggaussian`](@ref) or by fitting an
+arbitrary odd kernel with `SlidingDST(h; K, kind, moments)`.
+"""
+struct SlidingDST{T,K} <: SlidingKernel{T}
+    N::Int
+    c::SVector{K,T}   # coefficients of the sine terms
+    ω::SVector{K,T}   # angular frequencies of the sine terms (all nonzero)
+
+    function SlidingDST{T,K}(N::Integer, c, ω) where {T,K}
+        N >= 0 || throw(ArgumentError("the kernel radius `N` must be non-negative, got $N"))
+        all(!iszero, ω) || throw(ArgumentError("the frequencies must be nonzero"))
+        new{T,K}(N, c, ω)
+    end
+end
+SlidingDST(N::Integer, c::SVector{K,T}, ω::SVector{K,T}) where {T,K} = SlidingDST{T,K}(N, c, ω)
+
+# The interface used by the filtering algorithm
+basisfunction(::SlidingDCT) = cos
+basisfunction(::SlidingDST) = sin
+hasdc(::SlidingDCT{T,K,DC}) where {T,K,DC} = DC
+hasdc(::SlidingDST) = false
+dccoef(kernel::SlidingDCT) = kernel.c0
+dccoef(::SlidingDST{T}) where {T} = zero(T)
+parity(::SlidingDCT) = 1   # h[-r] == parity * h[r]
+parity(::SlidingDST) = -1
+
+Base.convert(::Type{SlidingKernel{T}}, k::SlidingKernel{T}) where {T} = k
+Base.convert(::Type{SlidingKernel{T}}, k::SlidingDCT{S,K,DC}) where {T,S,K,DC} =
     SlidingDCT{T,K,DC}(k.N, SVector{K,T}(k.c), SVector{K,T}(k.ω), T(k.c0))
+Base.convert(::Type{SlidingKernel{T}}, k::SlidingDST{S,K}) where {T,S,K} =
+    SlidingDST{T,K}(k.N, SVector{K,T}(k.c), SVector{K,T}(k.ω))
 
-_reshape(kernel::SlidingDCT, ::Val{1}) = kernel
-_reshape(kernel::SlidingDCT, ::Val{N}) where {N} = ReshapedOneD{N,0}(kernel)
+_reshape(kernel::SlidingKernel, ::Val{1}) = kernel
+_reshape(kernel::SlidingKernel, ::Val{N}) where {N} = ReshapedOneD{N,0}(kernel)
 
-Base.axes(kernel::SlidingDCT) = (IdentityUnitRange(-kernel.N:kernel.N),)
-Base.size(kernel::SlidingDCT) = (2 * kernel.N + 1,)
-@inline function Base.getindex(kernel::SlidingDCT{T}, i::Int) where {T}
+Base.axes(kernel::SlidingKernel) = (IdentityUnitRange(-kernel.N:kernel.N),)
+Base.size(kernel::SlidingKernel) = (2 * kernel.N + 1,)
+@inline function Base.getindex(kernel::SlidingKernel, i::Int)
     @boundscheck checkbounds(kernel, i)
-    v = kernel.c0
+    f = basisfunction(kernel)
+    v = dccoef(kernel)
     for k in eachindex(kernel.c)
-        v += kernel.c[k] * cos(kernel.ω[k] * i)
+        v += kernel.c[k] * f(kernel.ω[k] * i)
     end
     return v
 end
@@ -669,31 +722,70 @@ K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for DCT-based
 constant-time Gaussian filter with moment preservation", IEEE International
 Conference on Acoustics, Speech and Signal Processing (ICASSP), 1498-1502 (2018).
 
-See also: [`KernelFactors.DCTGaussian`](@ref).
+See also: [`KernelFactors.SlidingDST`](@ref), [`KernelFactors.slidinggaussian`](@ref).
 """
 function SlidingDCT(h::AbstractVector; K::Integer = 3, kind::Integer = 7, moments = K >= 2 ? (0, 2) : (0,))
+    return slidingfit(h, K, kind, moments, false)
+end
+
+"""
+    SlidingDST(h; K = 3, kind = 5, moments = K >= 2 ? (1, 3) : (1,))
+
+Approximate the odd, centered kernel `h` (with axes `-N:N`) by a sum of `K`
+discrete sine transform (DST) basis functions, so that filtering with it can be
+performed in constant time per pixel, independent of `N`.
+
+The coefficients are the least-squares fit of `h` subject to exactly preserving
+the moments `Σᵣ rᵐ h[r]` for each (odd) order `m` listed in `moments`; pass
+`moments = ()` for an unconstrained least-squares fit. Preserving the first
+moment of a derivative kernel makes the filter exact on linear signals.
+
+`kind` selects the DST basis, i.e., the frequencies `ωₖ`:
+
+| `kind` | `ωₖ`, `k = 1, …, K`  |
+|:------:|:----------------------|
+| `1`    | `πk/(N+1)`            |
+| `3`    | `π(2k-1)/(2N+2)`      |
+| `5`    | `2πk/(2N+1)`          |
+| `7`    | `π(2k-1)/(2N+1)`      |
+
+DST-5 (the default) and DST-1 are usually the most accurate for derivatives of
+the Gaussian.
+
+The element type of the result matches `float(eltype(h))`.
+
+See also: [`KernelFactors.SlidingDCT`](@ref), [`KernelFactors.slidinggaussian`](@ref).
+"""
+function SlidingDST(h::AbstractVector; K::Integer = 3, kind::Integer = 5, moments = K >= 2 ? (1, 3) : (1,))
+    return slidingfit(h, K, kind, moments, true)
+end
+
+function slidingfit(h::AbstractVector, K, kind, moments, odd::Bool)
     ax = axes(h, 1)
     N = last(ax)
     first(ax) == -N || throw(ArgumentError("the kernel must have axes `-N:N`, got $ax (use `centered`)"))
     T = float(eltype(h))
-    all(r -> h[r] ≈ h[-r], 1:N) || throw(ArgumentError("the kernel must be even, i.e., h[r] == h[-r]"))
+    p = odd ? -1 : 1
+    all(r -> h[-r] ≈ p * h[r], 0:N) || throw(ArgumentError("the kernel must be $(odd ? "odd, i.e., h[-r] == -h[r]" : "even, i.e., h[-r] == h[r]")"))
     μ = map(m -> (m, sum(r -> T(r)^m * h[r], ax)), Tuple(moments))
-    return dctfit(T, r -> h[r], N, K, kind, μ)
+    return slidingfit(T, r -> h[r], N, K, kind, μ, odd)
 end
 
-# Fit `target(r)` for `r ∈ -N:N` by `K` cosine terms of the DCT type `kind`,
-# subject to Σᵣ rᵐ ĥ(r) = μₘ for each `(m, μₘ)` in `μ`.
-function dctfit(::Type{T}, target, N::Integer, K::Integer, kind::Integer, μ) where {T}
+# Fit `target(r)` for `r ∈ -N:N` by `K` cosine (or sine, if `odd`) terms of the
+# DCT (DST) type `kind`, subject to Σᵣ rᵐ ĥ(r) = μₘ for each `(m, μₘ)` in `μ`.
+function slidingfit(::Type{T}, target, N::Integer, K::Integer, kind::Integer, μ, odd::Bool) where {T}
     kind ∈ (1, 3, 5, 7) || throw(ArgumentError("`kind` must be one of 1, 3, 5 or 7, got $kind"))
     K >= 1 || throw(ArgumentError("`K` must be at least 1, got $K"))
     M = length(μ)
-    # h[0:N] determines an even kernel, so at most N+1 cosines are linearly independent
-    K <= N + 1 || throw(ArgumentError("`K` must not exceed `N + 1` = $(N + 1); increase the kernel radius"))
+    # h[0:N] (h[1:N]) determines an even (odd) kernel, which limits the number of independent terms
+    Kmax = odd ? N : N + 1
+    K <= Kmax || throw(ArgumentError("`K` must not exceed $Kmax for a kernel of radius $N; increase the kernel radius"))
     M <= K || throw(ArgumentError("cannot preserve $M moments with only `K` = $K terms"))
     Tf = promote_type(T, Float64)
-    ω = dctfrequencies(Tf, kind, N, K)
+    ω = slidingfrequencies(Tf, kind, N, K, odd)
+    f = odd ? sin : cos
     rs = -N:N
-    C = [cos(ωk * r) for r in rs, ωk in ω]
+    C = [f(ωk * r) for r in rs, ωk in ω]
     h = Tf[target(r) for r in rs]
     if M == 0
         c = C \ h
@@ -704,6 +796,7 @@ function dctfit(::Type{T}, target, N::Integer, K::Integer, kind::Integer, μ) wh
         rhs = [2 * (C' * h); [Tf(μm) / s[i] for (i, (_, μm)) in enumerate(μ)]]
         c = ([2 * (C' * C) U'; U zeros(Tf, M, M)] \ rhs)[1:K]
     end
+    odd && return SlidingDST(N, SVector{K,T}(c), SVector{K,T}(ω))
     DC = iszero(first(ω))
     c0 = DC ? T(c[1]) : zero(T)
     idx = DC ? (2:K) : (1:K)
@@ -711,7 +804,13 @@ function dctfit(::Type{T}, target, N::Integer, K::Integer, kind::Integer, μ) wh
     return SlidingDCT(N, SVector{Kosc,T}(c[idx]), SVector{Kosc,T}(ω[idx]), c0, DC)
 end
 
-function dctfrequencies(::Type{T}, kind::Integer, N::Integer, K::Integer) where {T}
+function slidingfrequencies(::Type{T}, kind::Integer, N::Integer, K::Integer, odd::Bool) where {T}
+    if odd
+        kind == 1 && return [T(π) * k / (N + 1) for k in 1:K]
+        kind == 3 && return [T(π) * (2k - 1) / (2N + 2) for k in 1:K]
+        kind == 5 && return [2 * T(π) * k / (2N + 1) for k in 1:K]
+        return [T(π) * (2k - 1) / (2N + 1) for k in 1:K]
+    end
     kind == 1 && return [T(π) * k / N for k in 0:K-1]
     kind == 3 && return [T(π) * (2k + 1) / (2N + 2) for k in 0:K-1]
     kind == 5 && return [2 * T(π) * k / (2N + 1) for k in 0:K-1]
@@ -753,25 +852,39 @@ function refine_radius(err, N::Integer, Nmin::Integer)
 end
 
 """
-    DCTGaussian([T], σ; K = 3, N, kind = 7, emit_warning = true)
+    slidinggaussian([T], σ; order = 0, K, N, kind, emit_warning = true)
 
-Construct a [`KernelFactors.SlidingDCT`](@ref) approximation of a Gaussian of
-standard deviation `σ`. Filtering with it costs `O(K)` operations per pixel,
+Construct a [`KernelFactors.SlidingKernel`](@ref) approximation of a Gaussian of
+standard deviation `σ` (`order = 0`), or of its first (`order = 1`) or second
+(`order = 2`) derivative. Filtering with it costs `O(K)` operations per pixel,
 independently of `σ`, which makes it the fastest choice for large `σ`.
 
+The derivative kernels are oriented so that `imfilter(img, kernel)` computes the
+corresponding derivative of the Gaussian-smoothed `img` (`imfilter` computes a
+correlation).
+
 The kernel is the least-squares approximation, on `-N:N`, of the sampled Gaussian
-by `K` DCT basis functions, constrained to preserve the sum (so that constant
-images are unchanged) and, if `K ≥ 2`, the variance of the Gaussian. Increasing `K` improves
-the accuracy at the cost of speed: the maximal error relative to the peak of the
-kernel is about `5e-2`, `4e-3`, `1e-3`, `2e-4` and `4e-5` for `K = 2, …, 6`.
+(derivative) by `K` terms, constrained to preserve its low-order moments: the sum
+and the second moment for `order = 0` and `2`, the first and third moments for
+`order = 1` (only the lowest one if `K = 1`). Consequently, constant images are
+unchanged by the Gaussian and the derivatives are exact for polynomials of low degree.
+
+Increasing `K` improves the accuracy at the cost of speed. The defaults, `K = 3`
+for `order` 0 and 1 and `K = 4` for `order = 2`, give a relative L2 error of the
+kernel of about `5e-3`, `1e-2` and `2e-2`, respectively; each additional term
+reduces it by a factor 3 to 10. Even orders use a DCT-7 basis and odd orders a
+DST-5 basis by default (see [`KernelFactors.SlidingDCT`](@ref) and
+[`KernelFactors.SlidingDST`](@ref) for the other choices of `kind`).
+
 Unless specified, the radius `N` minimizes the L2 (energy) error of the kernel with
-respect to the untruncated Gaussian, which balances the truncation of the kernel in
-space and in frequency ("dual-domain error minimization", Sugimoto & Kamata 2015).
-See [`KernelFactors.SlidingDCT`](@ref) for the meaning of `kind`.
+respect to the untruncated Gaussian (derivative), which balances the truncation of
+the kernel in space and in frequency ("dual-domain error minimization", Sugimoto &
+Kamata 2015).
 
 `σ` may either be a single real number or a tuple of numbers; in the latter case,
 a tuple of such filters will be created, each for filtering a different dimension
-of an array.
+of an array. Then, `order`, `K`, `N` and `kind` may be given either as a single
+value or as a tuple with one value per dimension.
 
 Optionally specify the type `T` for the filter coefficients; if not
 supplied, it will match `σ` (unless `σ` is not floating-point, in
@@ -780,7 +893,10 @@ which case `Float64` will be chosen).
 # Examples
 
 ```julia
-imgf = imfilter(img, KernelFactors.DCTGaussian((10, 10)))
+# Gaussian smoothing
+imgs = imfilter(img, KernelFactors.slidinggaussian((10, 10)))
+# derivative along the first dimension of the image smoothed with σ = 3
+imgx = imfilter(img, KernelFactors.slidinggaussian((3, 3); order = (1, 0)))
 ```
 
 # Citation
@@ -793,45 +909,167 @@ K. Sugimoto, S. Kyochi and S. Kamata, "Universal approach for DCT-based
 constant-time Gaussian filter with moment preservation", IEEE International
 Conference on Acoustics, Speech and Signal Processing (ICASSP), 1498-1502 (2018).
 
-See also: [`KernelFactors.IIRGaussian`](@ref), [`KernelFactors.gaussian`](@ref).
+See also: [`KernelFactors.DCTGaussian`](@ref), [`KernelFactors.DCTLoG`](@ref),
+[`KernelFactors.DCTDoG`](@ref), [`KernelFactors.IIRGaussian`](@ref).
 """
-function DCTGaussian(::Type{T}, σ::Real; K::Integer = 3, N::Union{Integer,Nothing} = nothing,
-                     kind::Integer = 7, emit_warning::Bool = true) where {T}
+function slidinggaussian(::Type{T}, σ::Real; order::Integer = 0, K = nothing, N = nothing, kind = nothing,
+                         emit_warning::Bool = true) where {T}
+    return _slidinggaussian(T, σ, order, K, N, kind, emit_warning)
+end
+slidinggaussian(σ::Real; kwargs...) = slidinggaussian(iirgt(σ), σ; kwargs...)
+
+function slidinggaussian(::Type{T}, σs::NTuple{D,Real}; order = 0, K = nothing, N = nothing, kind = nothing,
+                         emit_warning::Bool = true) where {T,D}
+    perdim(x) = x isa Tuple ? x : ntuple(_ -> x, Val(D))
+    orders, Ks, Ns, kinds = perdim(order), perdim(K), perdim(N), perdim(kind)
+    all(x -> length(x) == D, (orders, Ks, Ns, kinds)) || throw(DimensionMismatch("expected one value per dimension"))
+    kernelfactors(ntuple(d -> _slidinggaussian(T, σs[d], orders[d], Ks[d], Ns[d], kinds[d], emit_warning), Val(D)))
+end
+slidinggaussian(σs::Tuple; kwargs...) = slidinggaussian(iirgt(σs), σs; kwargs...)
+slidinggaussian(σs::AbstractVector; kwargs...) = slidinggaussian((σs...,); kwargs...)
+slidinggaussian(::Type{T}, σs::AbstractVector; kwargs...) where {T} = slidinggaussian(T, (σs...,); kwargs...)
+
+function _slidinggaussian(::Type{T}, σ::Real, order::Integer, K, N, kind, emit_warning::Bool) where {T}
+    order ∈ (0, 1, 2) || throw(ArgumentError("`order` must be 0, 1 or 2, got $order"))
     σ >= 0 || throw(ArgumentError("σ must be non-negative, got $σ"))
     if iszero(σ)
+        order == 0 || throw(ArgumentError("σ must be positive for the derivatives of a Gaussian"))
         return SlidingDCT(0, SVector{0,T}(), SVector{0,T}(), one(T), true)  # the identity kernel
     end
+    K = something(K, order == 2 ? 4 : 3)
+    odd = isodd(order)
+    kind = something(kind, odd ? 5 : 7)
     emit_warning && σ < 1 && @warn("σ is too small for accuracy")
-    # The (untruncated) sampled Gaussian and its moments
+    # The (untruncated) sampled Gaussian (derivative) and its moments
     Tf = promote_type(T, Float64)
     M = max(something(N, 0), ceil(Int, (K + 3) * σ)) + ceil(Int, 10σ)
-    g = OffsetArray([exp(-Tf(r)^2 / (2 * Tf(σ)^2)) for r in -M:M], -M:M)
+    g = [exp(-Tf(r)^2 / (2 * Tf(σ)^2)) for r in -M:M]
     g ./= sum(g)
-    μ2 = sum(r -> Tf(r)^2 * g[r], -M:M)
-    μ = K == 1 ? ((0, one(Tf)),) : ((0, one(Tf)), (2, μ2))
-    fit(N) = dctfit(Tf, r -> g[r], N, K, kind, μ)
+    s2 = Tf(σ)^2
+    h = OffsetArray(order == 0 ? g : order == 1 ? (-M:M) .* g ./ s2 : ((-M:M) .^ 2 .- s2) .* g ./ s2^2, -M:M)
+    orders = order == 0 ? (0, 2) : order == 1 ? (1, 3) : (0, 2)
+    orders = K >= 2 ? orders : order == 2 ? (2,) : orders[1:1]
+    μ = map(m -> (m, sum(r -> Tf(r)^m * h[r], -M:M)), orders)
+    fit(n) = slidingfit(Tf, r -> h[r], n, K, kind, μ, odd)
     if N === nothing
         # Minimize the L2 error, including the truncation outside -N:N
-        Nmin = max(K - 1, 1)  # K ≤ N + 1 is required by the fit
-        gnorm2 = sum(abs2, g)
-        err(n) = (k = fit(n); (sum(r -> abs2(k[r] - g[r]), -n:n) + gnorm2 - sum(r -> abs2(g[r]), -n:n)))
-        N = refine_radius(err, dctgaussian_radius(σ, kind ∈ (1, 5) ? K - 1 : K), Nmin)
+        Nmin = max(odd ? K : K - 1, 1)
+        hnorm2 = sum(abs2, h)
+        err(n) = (k = fit(n); sum(r -> abs2(k[r] - h[r]), -n:n) + hnorm2 - sum(r -> abs2(h[r]), -n:n))
+        N = refine_radius(err, dctgaussian_radius(σ, !odd && kind ∈ (1, 5) ? K - 1 : K), Nmin)
     end
-    return convert(SlidingDCT{T}, fit(N))
+    return convert(SlidingKernel{T}, fit(N))
 end
-DCTGaussian(σ::Real; kwargs...) = DCTGaussian(iirgt(σ), σ; kwargs...)
 
-function DCTGaussian(::Type{T}, σs::NTuple{D,Real}; N = map(σ -> nothing, σs), kwargs...) where {T,D}
-    Ns = N isa Tuple ? N : ntuple(_ -> N, Val(D))
-    kernelfactors(ntuple(d -> _dctgaussian(T, σs[d], Ns[d]; kwargs...), Val(D)))
-end
-DCTGaussian(σs::Tuple; kwargs...) = DCTGaussian(iirgt(σs), σs; kwargs...)
+"""
+    DCTGaussian([T], σ; K = 3, N, kind = 7, emit_warning = true)
 
+Construct a constant-time approximation of a Gaussian of standard deviation `σ`
+(a single number, or a tuple with one value per dimension). This is equivalent to
+`slidinggaussian([T], σ; order = 0, ...)`: see [`KernelFactors.slidinggaussian`](@ref).
+
+The approximation is much more accurate than [`KernelFactors.IIRGaussian`](@ref),
+for a similar speed; the error relative to the peak of the kernel is about `5e-2`,
+`5e-3`, `1e-3`, `2e-4` and `4e-5` for `K = 2, …, 6`.
+
+# Examples
+
+```julia
+imgf = imfilter(img, KernelFactors.DCTGaussian((10, 10)))
+```
+
+See also: [`KernelFactors.gaussian`](@ref), [`KernelFactors.DCTLoG`](@ref).
+"""
+DCTGaussian(::Type{T}, σ::Union{Real,Tuple}; kwargs...) where {T} = slidinggaussian(T, σ; order = 0, kwargs...)
+DCTGaussian(σ::Union{Real,Tuple}; kwargs...) = slidinggaussian(σ; order = 0, kwargs...)
 DCTGaussian(σs::AbstractVector; kwargs...) = DCTGaussian((σs...,); kwargs...)
 DCTGaussian(::Type{T}, σs::AbstractVector; kwargs...) where {T} = DCTGaussian(T, (σs...,); kwargs...)
 
-_dctgaussian(::Type{T}, σ, ::Nothing; kwargs...) where {T} = DCTGaussian(T, σ; kwargs...)
-_dctgaussian(::Type{T}, σ, N::Integer; kwargs...) where {T} = DCTGaussian(T, σ; N = N, kwargs...)
+#### Sums of separable kernels
+
+"""
+    SeparableSum(terms, [weights])
+
+A kernel that is the weighted sum `Σᵢ weights[i] * kᵢ` of separable kernels, where
+each `terms[i]` is the tuple of factors of `kᵢ` (e.g., as returned by
+[`kernelfactors`](@ref) or [`KernelFactors.slidinggaussian`](@ref)). By default,
+all weights are 1.
+
+`imfilter` filters with each term, using the most efficient algorithm for it, and
+adds the results; all the usual options (border, algorithm, element type, ...)
+apply to each term.
+
+See also: [`KernelFactors.DCTLoG`](@ref), [`KernelFactors.DCTDoG`](@ref).
+"""
+struct SeparableSum{N,TT<:Tuple{Vararg{Tuple}},W<:Tuple}
+    terms::TT
+    weights::W
+
+    function SeparableSum(terms::Tuple{Tuple,Vararg{Tuple}}, weights::Tuple)
+        length(terms) == length(weights) || throw(DimensionMismatch("expected $(length(terms)) weights, got $(length(weights))"))
+        n = map(t -> map(ndims, t), terms)
+        N = ndims(first(first(terms)))
+        all(m -> all(==(N), m), n) || throw(DimensionMismatch("all factors must have the same dimensionality, got $n"))
+        new{N,typeof(terms),typeof(weights)}(terms, weights)
+    end
+end
+SeparableSum(terms::Tuple{Tuple,Vararg{Tuple}}) = SeparableSum(terms, map(_ -> true, terms))
+
+Base.ndims(::SeparableSum{N}) where {N} = N
+Base.eltype(kernel::SeparableSum) =
+    promote_type(map(t -> promote_type(map(eltype, t)...), kernel.terms)..., map(typeof, kernel.weights)...)
+# The smallest axes containing the support of all terms
+function Base.axes(kernel::SeparableSum{N}) where {N}
+    termaxes = map(kernel.terms) do t
+        ntuple(d -> sum(k -> first(axes(k)[d]), t):sum(k -> last(axes(k)[d]), t), Val(N))
+    end
+    ntuple(d -> minimum(a -> first(a[d]), termaxes):maximum(a -> last(a[d]), termaxes), Val(N))
+end
+function Base.show(io::IO, kernel::SeparableSum{N}) where {N}
+    print(io, "SeparableSum of $(length(kernel.terms)) $(N)-dimensional separable kernels with axes $(axes(kernel))")
+end
+
+"""
+    DCTLoG([T], σ; K0 = 3, K2 = 4, emit_warning = true)
+
+Construct a constant-time approximation of the Laplacian of Gaussian
+`∇²G = Σ_d ∂²G/∂x_d²`, as a [`KernelFactors.SeparableSum`](@ref) whose `d`-th term
+filters with a second-derivative kernel along dimension `d` and with Gaussian
+kernels along the others. `σ` may be a single number, for a symmetric 2d kernel,
+or a tuple with one value per dimension (as for [`Kernel.LoG`](@ref)).
+
+`K2` and `K0` are the number of terms of the second-derivative and Gaussian
+factors, respectively: see [`KernelFactors.slidinggaussian`](@ref).
+"""
+function DCTLoG(::Type{T}, σs::NTuple{D,Real}; K0::Integer = 3, K2::Integer = 4, emit_warning::Bool = true) where {T,D}
+    gs = ntuple(d -> _slidinggaussian(T, σs[d], 0, K0, nothing, nothing, emit_warning), Val(D))
+    g2s = ntuple(d -> _slidinggaussian(T, σs[d], 2, K2, nothing, nothing, emit_warning), Val(D))
+    SeparableSum(ntuple(d -> kernelfactors(ntuple(i -> i == d ? g2s[i] : gs[i], Val(D))), Val(D)))
+end
+DCTLoG(σs::Tuple; kwargs...) = DCTLoG(iirgt(σs), σs; kwargs...)
+DCTLoG(::Type{T}, σ::Real; kwargs...) where {T} = DCTLoG(T, (σ, σ); kwargs...)
+DCTLoG(σ::Real; kwargs...) = DCTLoG((σ, σ); kwargs...)
+
+"""
+    DCTDoG([T], σp, σm; K = 3, emit_warning = true)
+    DCTDoG([T], σ; K = 3, emit_warning = true)
+
+Construct a constant-time approximation of the difference of Gaussians
+`G(σp) - G(σm)`, as a [`KernelFactors.SeparableSum`](@ref). `σp` and `σm` are tuples
+with one value per dimension; when a single `σ` is supplied, `σp = σ` and
+`σm = √2 σ`, and if it is a number a symmetric 2d kernel is returned (as for
+[`Kernel.DoG`](@ref)). `K` is the number of terms of each Gaussian factor: see
+[`KernelFactors.slidinggaussian`](@ref).
+"""
+function DCTDoG(::Type{T}, σps::NTuple{D,Real}, σms::NTuple{D,Real}; K::Integer = 3, emit_warning::Bool = true) where {T,D}
+    SeparableSum((slidinggaussian(T, σps; K = K, emit_warning = emit_warning),
+                  slidinggaussian(T, σms; K = K, emit_warning = emit_warning)), (true, -1))
+end
+DCTDoG(σps::Tuple, σms::Tuple; kwargs...) = DCTDoG(iirgt((σps..., σms...)), σps, σms; kwargs...)
+DCTDoG(::Type{T}, σps::Tuple; kwargs...) where {T} = DCTDoG(T, σps, map(s -> s * √2, σps); kwargs...)
+DCTDoG(σps::Tuple; kwargs...) = DCTDoG(σps, map(s -> s * √2, σps); kwargs...)
+DCTDoG(::Type{T}, σ::Real; kwargs...) where {T} = DCTDoG(T, (σ, σ); kwargs...)
+DCTDoG(σ::Real; kwargs...) = DCTDoG((σ, σ); kwargs...)
 
 ###### Utilities
 
@@ -874,6 +1112,7 @@ if Base.VERSION >= v"1.4.2" && ccall(:jl_generating_output, Cint, ()) == 1
         precompile(gaussian, (T, Int))
         precompile(IIRGaussian, (Tuple{T,T},))
         precompile(DCTGaussian, (Tuple{T,T},))
+        precompile(DCTLoG, (Tuple{T,T},))
     end
 end
 

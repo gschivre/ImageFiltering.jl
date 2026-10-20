@@ -1091,20 +1091,22 @@ function rightΔu(img, uplus, Ibegin, i, Iend, kernel::TriggsSdika{T,3,l}) where
     ret
 end
 
-### Sliding DCT (constant-time filtering with a SlidingDCT kernel)
+### Sliding DCT/DST (constant-time filtering with a SlidingKernel)
 # K. Sugimoto and S. Kamata, "Efficient constant-time Gaussian filtering with
 # sliding DCT/DST-5 and dual-domain error minimization". ITE Trans. on Media
 # Technology and Applications 3: 12-21 (2015).
 #
-# For h[r] = c₀ + Σₖ cₖ cos(ωₖ r) on -N:N, the output is y(t) = Z₀(t) + Σₖ Zₖ(t) with
-#     Zₖ(t) = cₖ Σ_{r=-N}^{N} cos(ωₖ r) x(t+r).
-# Since cos(ω(r-1)) + cos(ω(r+1)) = 2cos(ω) cos(ωr),
-#     Zₖ(t+1) = 2cos(ωₖ) Zₖ(t) - Zₖ(t-1) + cₖ cos(ωₖ N)     (x(t+N+1) + x(t-N-1))
-#                                       - cₖ cos(ωₖ (N+1)) (x(t+N)   + x(t-N)),
+# For h[r] = c₀ + Σₖ cₖ f(ωₖ r) on -N:N, with f = cos (DCT) or f = sin (DST, c₀ = 0),
+# the output is y(t) = Z₀(t) + Σₖ Zₖ(t) with
+#     Zₖ(t) = cₖ Σ_{r=-N}^{N} f(ωₖ r) x(t+r).
+# Since f(ω(r-1)) + f(ω(r+1)) = 2cos(ω) f(ωr), and f(-x) = p f(x) with the parity
+# p = 1 for cos and p = -1 for sin,
+#     Zₖ(t+1) = 2cos(ωₖ) Zₖ(t) - Zₖ(t-1) + cₖ f(ωₖ N)     (x(t+N+1) + p x(t-N-1))
+#                                       - cₖ f(ωₖ (N+1)) (x(t+N)   + p x(t-N)),
 # while the DC term is a running sum, Z₀(t+1) = Z₀(t) + c₀ (x(t+N+1) - x(t-N)).
 # Only the first two outputs along each line are computed directly.
 #
-# A SlidingDCT is an ordinary FIR kernel, so any algorithm can use it. With the
+# A SlidingKernel is an ordinary FIR kernel, so any algorithm can use it. With the
 # DCT algorithm, borders are handled by "virtual" padding: along the filtered
 # dimension, the input is read through an index map produced by `padindex`, so
 # that neither the padded image nor the padded intermediate results are ever
@@ -1114,7 +1116,7 @@ end
 function imfilter!(r::AbstractResource{DCT},
                    out::AbstractArray{S,N},
                    img::AbstractArray{T,N},
-                   kernel::Tuple{AnyDCT,Vararg{AnyDCT}},
+                   kernel::Tuple{AnySliding,Vararg{AnySliding}},
                    border::Union{Pad{0},Fill{<:Any,0}}) where {S,T,N}
     isempty(img) && return out
     kernN = filter(k -> !iscopy(k), samedims(out, kernel))
@@ -1141,56 +1143,56 @@ function imfilter!(r::AbstractResource{DCT},
     return out
 end
 
-_dctdim(::SlidingDCT) = 1
+_dctdim(::SlidingKernel) = 1
 _dctdim(::ReshapedOneD{T,N,Npre}) where {T,N,Npre} = Npre + 1
 
 _filtered_border(border::Pad, kern) = border
 _filtered_border(border::Fill, kern::ReshapedOneD) = _filtered_border(border, kern.data)
-_filtered_border(border::Fill, kern::SlidingDCT) = Fill(border.value * sum(kern), border.lo, border.hi)
+_filtered_border(border::Fill, kern::SlidingKernel) = Fill(border.value * sum(kern), border.lo, border.hi)
 
 function imfilter!(r::AbstractResource{DCT},
                    out::AbstractArray{S,N},
                    img::AbstractArray{T,N},
-                   kernel::Tuple{AnyDCT,Vararg{AnyDCT}},
+                   kernel::Tuple{AnySliding,Vararg{AnySliding}},
                    border::Inner{0}) where {S,T,N}
     imfilter!(r, out, padarray(S, img, border(kernel)), kernel, NoPad(border))
 end
 
 """
-    imfilter!(r::AbstractResource, imgfilt, img, kernel::SlidingDCT, dim::Integer, border)
+    imfilter!(r::AbstractResource, imgfilt, img, kernel::SlidingKernel, dim::Integer, border)
 
-Filter an array `img` along dimension `dim` with a [`KernelFactors.SlidingDCT`](@ref)
+Filter an array `img` along dimension `dim` with a [`KernelFactors.SlidingKernel`](@ref)
 `kernel`, storing the result in `imgfilt`, at a cost per pixel that is independent of
 the length of the kernel. Unlike the `FIR` and `FFT` algorithms, this version is safe
 for inplace operations, i.e., `imgfilt` can be the same array as `img`.
 
-See also: [`imfilter`](@ref), [`KernelFactors.DCTGaussian`](@ref).
+See also: [`imfilter`](@ref), [`KernelFactors.slidinggaussian`](@ref).
 """
-function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SlidingDCT, dim::Integer, border::Union{Pad{0},Fill{<:Any,0}})
+function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SlidingKernel, dim::Integer, border::Union{Pad{0},Fill{<:Any,0}})
     1 <= dim <= ndims(img) || throw(ArgumentError("dimension $dim is out of range for an array of dimension $(ndims(img))"))
     axes(out) == axes(img) || throw(DimensionMismatch("output axes $(axes(out)) must match the input axes $(axes(img))"))
     src = Base.mightalias(out, img) ? copy(img) : img
     inds = axes(img)
     _imfilter_dct_line!(out, src, kernel, CartesianIndices(inds[1:dim-1]), inds[dim], CartesianIndices(inds[dim+1:end]), border)
 end
-function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SlidingDCT, dim::Integer, border::AbstractString)
+function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SlidingKernel, dim::Integer, border::AbstractString)
     imfilter!(r, out, img, kernel, dim, Pad(Symbol(border)))
 end
 
-function _imfilter_dct_virtual!(out, img, kern::ReshapedDCT, border)
+function _imfilter_dct_virtual!(out, img, kern::ReshapedSliding, border)
     Rpre, ind, Rpost = iterdims(axes(img), kern)
     _imfilter_dct_line!(out, img, kern.data, Rpre, ind, Rpost, border)
 end
-function _imfilter_dct_virtual!(out, img::AbstractVector, kern::SlidingDCT, border)
+function _imfilter_dct_virtual!(out, img::AbstractVector, kern::SlidingKernel, border)
     _imfilter_dct_line!(out, img, kern, CartesianIndices(()), axes(img, 1), CartesianIndices(()), border)
 end
 
-function _imfilter_dct_line!(out, img, kernel::SlidingDCT, Rpre, ind, Rpost, border::Pad)
+function _imfilter_dct_line!(out, img, kernel::SlidingKernel, Rpre, ind, Rpost, border::Pad)
     N = kernel.N
     pidx = padindex(border, N, ind, N)
     _imfilter_dct!(out, img, kernel, Rpre, ind, Rpost, pidx, nothing, zero(eltype(Rpre)), zero(eltype(Rpost)))
 end
-function _imfilter_dct_line!(out, img, kernel::SlidingDCT, Rpre, ind, Rpost, border::Fill)
+function _imfilter_dct_line!(out, img, kernel::SlidingKernel, Rpre, ind, Rpost, border::Fill)
     N = kernel.N
     # out-of-bounds positions are marked by a sentinel and replaced by the fill value
     pidx = OffsetArray([checkindex(Bool, ind, t) ? t : typemin(Int) for t in first(ind)-N:last(ind)+N], first(ind)-N:last(ind)+N)
@@ -1199,18 +1201,18 @@ end
 
 # With explicit padding: `out[I]` depends on `A[I + J]`, and we index the parent of
 # padded (Offset) arrays directly for speed (see also the FIR specializations above)
-function _imfilter_inbounds!(r::AbstractResource, out, A::AbstractArray, kern::ReshapedDCT, border::NoPad, inds)
+function _imfilter_inbounds!(r::AbstractResource, out, A::AbstractArray, kern::ReshapedSliding, border::NoPad, inds)
     Rpre, ind, Rpost = iterdims(inds, kern)
     _imfilter_dct_padded!(out, A, kern.data, Rpre, ind, Rpost, ntuple(_ -> 0, ndims(A)), kern)
 end
-function _imfilter_inbounds!(r::AbstractResource, out, A::OffsetArray, kern::ReshapedDCT, border::NoPad, inds)
+function _imfilter_inbounds!(r::AbstractResource, out, A::OffsetArray, kern::ReshapedSliding, border::NoPad, inds)
     Rpre, ind, Rpost = iterdims(inds, kern)
     _imfilter_dct_padded!(out, parent(A), kern.data, Rpre, ind, Rpost, A.offsets, kern)
 end
-function _imfilter_inbounds!(r::AbstractResource, out, A::AbstractVector, kern::SlidingDCT, border::NoPad, inds)
+function _imfilter_inbounds!(r::AbstractResource, out, A::AbstractVector, kern::SlidingKernel, border::NoPad, inds)
     _imfilter_dct_padded!(out, A, kern, CartesianIndices(()), inds[1], CartesianIndices(()), (0,), ReshapedOneD{1,0}(kern))
 end
-function _imfilter_inbounds!(r::AbstractResource, out, A::OffsetVector, kern::SlidingDCT, border::NoPad, inds)
+function _imfilter_inbounds!(r::AbstractResource, out, A::OffsetVector, kern::SlidingKernel, border::NoPad, inds)
     _imfilter_dct_padded!(out, parent(A), kern, CartesianIndices(()), inds[1], CartesianIndices(()), A.offsets, ReshapedOneD{1,0}(kern))
 end
 function _imfilter_dct_padded!(out, A, kernel, Rpre, ind, Rpost, offsets, kern)
@@ -1227,11 +1229,12 @@ end
 #
 # `out[Ipre, t, Ipost]` is computed from `A[Ipre - Opre, pidx[t + r], Ipost - Opost]`
 # for -N ≤ r ≤ N, where `pidx[j] == typemin(Int)` stands for `fillvalue`.
-@noinline function _imfilter_dct!(out, A, kernel::SlidingDCT{T,K,DC},
+@noinline function _imfilter_dct!(out, A, kernel::Union{SlidingDCT{T,K},SlidingDST{T,K}},
                                   Rpre::CartesianIndices, ind::AbstractUnitRange, Rpost::CartesianIndices,
-                                  pidx::AbstractVector{Int}, fillvalue, Opre::CartesianIndex, Opost::CartesianIndex) where {T,K,DC}
+                                  pidx::AbstractVector{Int}, fillvalue, Opre::CartesianIndex, Opost::CartesianIndex) where {T,K}
     (isempty(ind) || isempty(Rpre) || isempty(Rpost)) && return out
-    N, c, ω, c0 = kernel.N, kernel.c, kernel.ω, kernel.c0
+    N, c, ω, c0 = kernel.N, kernel.c, kernel.ω, KernelFactors.dccoef(kernel)
+    DC, f, par = KernelFactors.hasdc(kernel), KernelFactors.basisfunction(kernel), KernelFactors.parity(kernel)
     t0, tend = first(ind), last(ind)
     # Validate all indices once, which justifies the @inbounds below
     checkbounds(pidx, t0-N:tend+N)
@@ -1245,13 +1248,13 @@ end
     Tz = typeof(p + p)
     fillz = fillvalue === nothing ? zero(Tz) : convert(Tz, fillvalue)
     α = 2 .* cos.(ω)
-    a = c .* cos.(ω .* N)
-    b = c .* cos.(ω .* (N + 1))
+    a = c .* f.(ω .* N)
+    b = c .* f.(ω .* (N + 1))
     P = length(Rpre)
     Zprev = Vector{SVector{K,Tz}}(undef, P)  # Zₖ(t-1)
     Z = Vector{SVector{K,Tz}}(undef, P)      # Zₖ(t)
     S = Vector{Tz}(undef, DC ? P : 0)        # Z₀(t)
-    W = [c .* cos.(ω .* r) for r in -N:N]    # weights for the direct computation
+    W = [c .* f.(ω .* r) for r in -N:N]      # weights for the direct computation
     for Ipost in Rpost
         IOpost = Ipost - Opost
         _dct_direct!(Zprev, S, A, kernel, W, Rpre, Opre, pidx, t0, IOpost, fillz)
@@ -1265,8 +1268,8 @@ end
                 IOpre = Ipre - Opre
                 xfar = _dct_load(A, IOpre, jfar, IOpost, fillz)
                 xnearm = _dct_load(A, IOpre, jnearm, IOpost, fillz)
-                u = xfar + _dct_load(A, IOpre, jfarm, IOpost, fillz)
-                v = _dct_load(A, IOpre, jnear, IOpost, fillz) + xnearm
+                u = xfar + par * _dct_load(A, IOpre, jfarm, IOpost, fillz)
+                v = _dct_load(A, IOpre, jnear, IOpost, fillz) + par * xnearm
                 zt = Z[i]
                 znew = map((αk, zk, zpk, ak, bk) -> αk * zk - zpk + ak * u - bk * v, α, zt, Zprev[i], a, b)
                 Zprev[i], Z[i] = zt, znew
@@ -1289,7 +1292,8 @@ end
 end
 
 # Initialize Zₖ(t) (and Z₀(t)) from the definition, at a cost O(N)
-function _dct_direct!(Z, S, A, kernel::SlidingDCT{T,K,DC}, W, Rpre, Opre, pidx, t, IOpost, fillz::Tz) where {T,K,DC,Tz}
+function _dct_direct!(Z, S, A, kernel::Union{SlidingDCT{T,K},SlidingDST{T,K}}, W, Rpre, Opre, pidx, t, IOpost, fillz::Tz) where {T,K,Tz}
+    DC = KernelFactors.hasdc(kernel)
     fill!(Z, zero(SVector{K,Tz}))
     DC && fill!(S, zero(Tz))
     N = kernel.N
@@ -1302,7 +1306,7 @@ function _dct_direct!(Z, S, A, kernel::SlidingDCT{T,K,DC}, W, Rpre, Opre, pidx, 
             DC && (S[i] += x)
         end
     end
-    DC && (S .*= kernel.c0)
+    DC && (S .*= KernelFactors.dccoef(kernel))
     return Z
 end
 
@@ -1310,6 +1314,58 @@ function _dct_output!(out, Z, S, Rpre, t, Ipost, ::Val{DC}) where {DC}
     @inbounds for (i, Ipre) in enumerate(Rpre)
         y = reduce(+, Z[i]; init = zero(eltype(eltype(Z))))
         out[Ipre, t, Ipost] = DC ? y + S[i] : y
+    end
+    return out
+end
+
+### Sums of separable kernels
+# Each term is filtered with the usual machinery (and hence the most efficient
+# algorithm for it), and the results are added.
+
+function imfilter(::Type{T}, img::AbstractArray, kernel::SeparableSum, args...) where {T}
+    _imfilter_sum(term -> imfilter(T, img, term, args...), kernel)
+end
+function imfilter(r::AbstractResource, img::AbstractArray, kernel::SeparableSum, args...)
+    imfilter(r, filter_type(img, kernel), img, kernel, args...)
+end
+function imfilter(r::AbstractResource, ::Type{T}, img::AbstractArray, kernel::SeparableSum, args...) where {T}
+    _imfilter_sum(term -> imfilter(r, T, img, term, args...), kernel)
+end
+
+function _imfilter_sum(f, kernel::SeparableSum)
+    outs = map(f, kernel.terms)
+    # With Inner(), the terms may be computed over different regions
+    R = CartesianIndices(reduce((a, b) -> map(intersect, a, b), map(axes, outs)))
+    out = first(outs)
+    if CartesianIndices(out) != R
+        out = copyto!(similar(out, R.indices), R, out, R)
+    end
+    w = first(kernel.weights)
+    isone(w) || (out .*= w)
+    for (o, w) in zip(tail(outs), tail(kernel.weights))
+        @inbounds for I in R
+            out[I] += w * o[I]
+        end
+    end
+    return out
+end
+
+function imfilter!(out::AbstractArray, img::AbstractArray, kernel::SeparableSum, args...)
+    _imfilter_sum!((o, i, term) -> imfilter!(o, i, term, args...), out, img, kernel)
+end
+function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SeparableSum, args...)
+    _imfilter_sum!((o, i, term) -> imfilter!(r, o, i, term, args...), out, img, kernel)
+end
+
+function _imfilter_sum!(f!, out, img, kernel::SeparableSum)
+    src = Base.mightalias(out, img) ? copy(img) : img
+    f!(out, src, first(kernel.terms))
+    w = first(kernel.weights)
+    isone(w) || (out .*= w)
+    tmp = similar(out)
+    for (term, w) in zip(tail(kernel.terms), tail(kernel.weights))
+        f!(tmp, src, term)
+        out .+= w .* tmp
     end
     return out
 end
@@ -1354,6 +1410,7 @@ end
 filter_type(img::AbstractArray{S}, kernel) where {S} = filter_type(S, kernel)
 
 filter_type(::Type{S}, kernel::ArrayLike{T}) where {S,T} = typeof(zero(S) * zero(T) + zero(S) * zero(T))
+filter_type(::Type{S}, kernel::SeparableSum) where {S} = promote_type(map(t -> filter_type(S, t), kernel.terms)...)
 filter_type(::Type{S}, ::Laplacian) where {S<:Union{Normed,FixedColorant}} = float32(S)
 filter_type(::Type{S}, kernel::Laplacian) where {S<:Colorant} = S
 filter_type(::Type{S}, ::Laplacian) where {S<:AbstractFloat} = S
@@ -1429,7 +1486,7 @@ function filter_algorithm(out, img, kernel::Union{ArrayType,Tuple{Vararg{ArrayTy
     isa(kernel, Tuple) && length(kernel) > 1 ? FIRTiled(padded_tilesize(eltype(out), sz)) : FIR()
 end
 filter_algorithm(out, img, kernel::Tuple{AnyIIR,Vararg{AnyIIR}}) = IIR()
-filter_algorithm(out, img, kernel::Tuple{AnyDCT,Vararg{AnyDCT}}) = DCT()
+filter_algorithm(out, img, kernel::Tuple{AnySliding,Vararg{AnySliding}}) = DCT()
 filter_algorithm(out, img, kernel) = Mixed()
 
 maxlen(A::AbstractArray) = length(A)

@@ -37,13 +37,19 @@ KernelFactors.ando3
 KernelFactors.ando4
 KernelFactors.ando5
 KernelFactors.bickley
+KernelFactors.DCTDoG
 KernelFactors.DCTGaussian
+KernelFactors.DCTLoG
 KernelFactors.gaussian
 KernelFactors.IIRGaussian
 KernelFactors.prewitt
 KernelFactors.scharr
-KernelFactors.sobel
+KernelFactors.SeparableSum
+KernelFactors.slidinggaussian
 KernelFactors.SlidingDCT
+KernelFactors.SlidingDST
+KernelFactors.SlidingKernel
+KernelFactors.sobel
 KernelFactors.TriggsSdika
 ```
 
