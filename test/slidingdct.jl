@@ -80,6 +80,9 @@ function agrees(img, ks, border = "replicate")
     return eltype(out) == eltype(ref) && filtersmatch(out, ref, img, ks, border)
 end
 fir(img, ks, args...) = imfilter(img, firkernel(ks), args..., Algorithm.FIR())
+# The floating-point type of the pixels of an image (Float32 for N0f8); kernels of this type
+# keep the computation in it, whereas Float64 kernels (the default) promote it to Float64
+pixelfloat(img) = float(eltype(eltype(img)))
 
 # Peak signal-to-noise ratio for images with values in [0, 1]
 psnr(a, ref) = 10 * log10(length(ref) / sum(abs2, a .- ref))
@@ -205,13 +208,15 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
                 @test agrees(x, k, border)
             end
         end
-        # n-d with various element types
+        # n-d with various element types, computing in the precision of the pixels (Float32
+        # for all but the first image); see the edge cases for promotion to Float64
         imgs = (rand(37, 41), rand(Float32, 64, 20), rand(Gray{N0f8}, 30, 25),
                 rand(RGB{N0f8}, 20, 22, 9), rand(RGB{Float32}, 3, 4, 5, 6))
         for img in imgs
             σs = ntuple(d -> 1 + 2d / 3, ndims(img))
             for (kind, K) in ((7, 3), (5, 2))
-                ks = DCTGaussian(σs; K = K, kind = kind)
+                ks = DCTGaussian(pixelfloat(img), σs; K = K, kind = kind)
+                @test eltype(eltype(imfilter(img, ks))) == pixelfloat(img)
                 for border in borders
                     border isa Fill && (border = Fill(zero(eltype(img))))
                     @test agrees(img, ks, border)
@@ -413,7 +418,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         for img in (rand(40, 50), rand(Gray{N0f8}, 30, 25), rand(RGB{Float32}, 20, 22, 9))
             σs = ntuple(d -> 1 + d / 2, ndims(img))
             for order in ((1, ntuple(_ -> 0, ndims(img) - 1)...), (0, 2, ntuple(_ -> 0, ndims(img) - 2)...))
-                ks = slidinggaussian(σs; order = order)
+                ks = slidinggaussian(pixelfloat(img), σs; order = order)
                 for border in ("replicate", "reflect", Fill(zero(eltype(img))), Fill(oneunit(eltype(img))))
                     @test agrees(img, ks, border)
                 end
@@ -528,24 +533,25 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
             x = zeros(2Nk); x[1] = 1
             @test filtersmatch(imfilter(x, k, Fill(0))[1:Nk+1], [k[-r] for r in 0:Nk], x, k)
         end
-        # Kernels that are not Gaussians: arbitrary coefficients and (non-harmonic) frequencies
+        # Kernels that are not Gaussians: arbitrary coefficients and (non-harmonic)
+        # frequencies, and smooth kernels fitted by SlidingDCT/SlidingDST
         kd = SlidingDCT(9, SVector(0.3, -0.2, 0.05), SVector(0.21, 0.83, 1.7), 0.1, true)
         ks = SlidingDST(9, SVector(0.4, 0.1), SVector(0.35, 2.2))
         kd32 = convert(SlidingKernel{Float32}, kd)
-        box = SlidingDCT(centered(fill(1 / 11, 11)); K = 4)                      # fitted box filter
-        tri = SlidingDCT(centered([1.0, 2, 3, 4, 5, 4, 3, 2, 1] / 25); K = 2)    # fitted triangle
-        hat = SlidingDCT(centered([(1 - r^2 / 9) * exp(-r^2 / 18) for r in -12.0:12.0]); K = 4)  # "Mexican hat"
-        ramp = SlidingDST(centered(collect(-6.0:6.0)); K = 3, kind = 1)          # fitted odd ramp
+        hhat = centered([(1 - r^2 / 36) * exp(-r^2 / 72) for r in -24.0:24.0])  # "Mexican hat"
+        hgab = centered([sin(0.4r) * exp(-r^2 / 128) for r in -24.0:24.0])     # odd Gabor kernel
+        hat, gab = SlidingDCT(hhat; K = 6), SlidingDST(hgab; K = 6)
         @test kd[3] ≈ 0.1 + 0.3cos(0.63) - 0.2cos(2.49) + 0.05cos(5.1)
         @test ks[-3] ≈ -(0.4sin(1.05) + 0.1sin(6.6))
+        @test l2err(hat, hhat) < 2e-3 && l2err(gab, hgab) < 4e-3   # (smooth kernels fit well)
         x = rand(60)
-        img = rand(Float32, 30, 40)
-        for k in (kd, ks, kd32, box, tri, hat, ramp), border in borders
+        img = rand(Float32, 30, 40)   # (with Float64 kernels: promoted to Float64)
+        for k in (kd, ks, kd32, hat, gab), border in borders
             border isa NA && continue
             @test agrees(x, k, border)
             @test agrees(img, kernelfactors((k, kd)), border)
         end
-        @test agrees(img, (kernelfactors((kd, ks))..., kernelfactors((box, ramp))...), "reflect")
+        @test agrees(img, (kernelfactors((kd, ks))..., kernelfactors((hat, gab))...), "reflect")
         # SubArrays (contiguous and strided), as input and as output
         A = rand(50, 60, 3)
         ks2 = slidinggaussian((2.0, 3.5); order = (1, 0))
@@ -595,7 +601,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         # Filtering by several tasks gives exactly the serial result. CI runs on a single
         # thread, so we call the task-based function directly with several tasks.
         img = rand(Float32, 70, 45, 3)
-        for ks in (DCTGaussian((2.0, 3.0, 1.5)), slidinggaussian((2.0, 3.0, 1.5); order = (1, 0, 2)))
+        for ks in (DCTGaussian(Float32, (2.0, 3.0, 1.5)), slidinggaussian((2.0, 3.0, 1.5); order = (1, 0, 2)))
             for k in ks
                 Rpre, ind, Rpost = KernelFactors.iterdims(axes(img), k)
                 N = k.data.N
@@ -631,6 +637,8 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
     @testset "inference" begin
         img = rand(Float32, 20, 20)
         @inferred imfilter(img, DCTGaussian((2.0, 3.0)))
+        @test @inferred(imfilter(img, DCTGaussian(Float32, (2.0, 3.0)))) isa Matrix{Float32}
+        @test @inferred(imfilter(rand(Gray{N0f8}, 10, 10), DCTLoG(Float32, 2.0))) isa Matrix{Gray{Float32}}
         @inferred imfilter(rand(RGB{N0f8}, 10, 10), DCTGaussian((2.0, 3.0)))
         @inferred imfilter(img, slidinggaussian((2.0, 3.0); order = (1, 0)))
         @inferred imfilter(img, DCTLoG(2.0))
