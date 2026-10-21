@@ -1306,28 +1306,53 @@ end
         t0 == tend && continue
         _dct_direct!(Z, S, A, kernel, W, Rpre, Opre, pidx, t0 + 1, IOpost, fillz)
         _dct_output!(out, Z, S, Rpre, t0 + 1, Ipost, Val(DC))
+        if P == 1
+            s0 = DC ? S[1] : zero(Tz)
+            _dct_line!(out, A, first(Rpre), Opre, Ipost, IOpost, t0, tend, N, pidx, Z[1], Zprev[1], s0, α, a, b, c0, par, fillz, Val(DC))
+            continue
+        end
         for t in t0+1:tend-1
             @inbounds jfar, jfarm, jnear, jnearm = pidx[t+N+1], pidx[t-N-1], pidx[t+N], pidx[t-N]
             @inbounds for (i, Ipre) in enumerate(Rpre)
-                IOpre = Ipre - Opre
-                xfar = _dct_load(A, IOpre, jfar, IOpost, fillz)
-                xnearm = _dct_load(A, IOpre, jnearm, IOpost, fillz)
-                u = xfar + par * _dct_load(A, IOpre, jfarm, IOpost, fillz)
-                v = _dct_load(A, IOpre, jnear, IOpost, fillz) + par * xnearm
                 zt = Z[i]
-                znew = map((αk, zk, zpk, ak, bk) -> αk * zk - zpk + ak * u - bk * v, α, zt, Zprev[i], a, b)
+                znew, s, y = _dct_step(A, Ipre - Opre, IOpost, jfar, jfarm, jnear, jnearm, zt, Zprev[i], DC ? S[i] : zero(Tz),
+                                       α, a, b, c0, par, fillz, Val(DC))
                 Zprev[i], Z[i] = zt, znew
-                y = reduce(+, znew; init = zero(Tz))
-                if DC
-                    s = S[i] + c0 * (xfar - xnearm)
-                    S[i] = s
-                    y += s
-                end
+                DC && (S[i] = s)
                 out[Ipre, t+1, Ipost] = y
             end
         end
     end
     out
+end
+
+# A single line (e.g., when filtering along the first dimension): the state of the
+# recurrence is kept in local variables, as storing it in memory would put a
+# store-to-load round trip on the dependency chain of every pixel
+function _dct_line!(out, A, Ipre, Opre, Ipost, IOpost, t0, tend, N, pidx, z, zp, s, α, a, b, c0, par, fillz, dc::Val)
+    IOpre = Ipre - Opre
+    @inbounds for t in t0+1:tend-1
+        jfar, jfarm, jnear, jnearm = pidx[t+N+1], pidx[t-N-1], pidx[t+N], pidx[t-N]
+        znew, s, y = _dct_step(A, IOpre, IOpost, jfar, jfarm, jnear, jnearm, z, zp, s, α, a, b, c0, par, fillz, dc)
+        zp, z = z, znew
+        out[Ipre, t+1, Ipost] = y
+    end
+    out
+end
+
+# One step of the recurrence for one line: the new state Zₖ(t+1), the new DC term and the output
+@inline function _dct_step(A, IOpre, IOpost, jfar, jfarm, jnear, jnearm, z, zp, s, α, a, b, c0, par, fillz::Tz, ::Val{DC}) where {Tz,DC}
+    xfar = _dct_load(A, IOpre, jfar, IOpost, fillz)
+    xnearm = _dct_load(A, IOpre, jnearm, IOpost, fillz)
+    u = xfar + par * _dct_load(A, IOpre, jfarm, IOpost, fillz)
+    v = _dct_load(A, IOpre, jnear, IOpost, fillz) + par * xnearm
+    znew = map((αk, zk, zpk, ak, bk) -> αk * zk - zpk + ak * u - bk * v, α, z, zp, a, b)
+    y = reduce(+, znew; init = zero(Tz))
+    if DC
+        s += c0 * (xfar - xnearm)
+        y += s
+    end
+    return znew, s, y
 end
 
 @inline function _dct_load(A, Ipre, j, Ipost, fillz::Tz) where {Tz}
