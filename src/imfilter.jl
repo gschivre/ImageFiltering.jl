@@ -1339,12 +1339,18 @@ function _imfilter_sum(f, kernel::SeparableSum)
     end
     w = first(kernel.weights)
     isone(w) || (out .*= w)
-    for (o, w) in zip(tail(outs), tail(kernel.weights))
-        @inbounds for I in R
-            out[I] += w * o[I]
-        end
+    return _addterms!(out, R, tail(outs), tail(kernel.weights))
+end
+
+# A function barrier (`out` may be one of two types above), recursing over the
+# terms since their types and those of the weights may differ
+_addterms!(out, R, ::Tuple{}, ::Tuple{}) = out
+function _addterms!(out, R, outs::Tuple, weights::Tuple)
+    o, w = first(outs), first(weights)
+    @inbounds for I in R
+        out[I] += w * o[I]
     end
-    return out
+    return _addterms!(out, R, tail(outs), tail(weights))
 end
 
 function imfilter!(out::AbstractArray, img::AbstractArray, kernel::SeparableSum, args...)

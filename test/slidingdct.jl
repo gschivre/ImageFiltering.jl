@@ -1,4 +1,4 @@
-using ImageFiltering, ImageCore, OffsetArrays, ComputationalResources
+using ImageFiltering, ImageCore, OffsetArrays, ComputationalResources, StaticArrays
 using ImageFiltering.KernelFactors: SlidingKernel, SlidingDCT, SlidingDST, SeparableSum, ReshapedOneD,
     DCTGaussian, slidinggaussian, DCTLoG, DCTDoG
 using Random, Test
@@ -7,11 +7,80 @@ using Random, Test
 firkernel(k::SlidingKernel) = OffsetArray(collect(k), axes(k))
 firkernel(k::ReshapedOneD{T,N,Npre}) where {T,N,Npre} = ReshapedOneD{N,Npre}(firkernel(k.data))
 firkernel(ks::Tuple) = map(firkernel, ks)
+firkernel(L::SeparableSum) = SeparableSum(map(firkernel, L.terms), L.weights)
 firkernel(k) = k
 
-maxabsdiff(a, b) = maximum(x -> sum(abs, channelview([float(x)])), a .- b)
-# Round-off tolerance for the (real) element type of an image
-rtol(img) = 100 * eps(eltype(eltype(img)))
+## Tolerances for comparing two computations of the same filter (sliding vs. FIR)
+#
+# We require |y - y_ref| ≤ atol + rtol |y_ref| for every pixel and color channel, with
+# rtol = 4eps(T) in the precision T of the computation (the lower of the precisions of
+# the result and of the kernel coefficients). The absolute term is the round-off
+# of the computation, which does not scale with |y_ref| (derivative outputs are small
+# because large terms cancel). For an input of magnitude X and a kernel
+# h[r] = c₀ + Σₖ cₖ cos(ωₖ r) on -N:N, each resonator of the recurrence carries a windowed
+# sum of size |cₖ|(2N+1)X and amplifies its rounding errors by up to 1/|sin ωₖ| (by up to
+# n for ωₖ = π, a double pole), and these errors accumulate as a random walk, ∝ √n,
+# along a line of length n. The FIR reference adds (2N+1)‖h‖₁X. In a cascade, the error
+# of each stage is scaled by the ℓ¹ norms of the other stages. With atol = 4eps(T) X
+# times this growth factor, the observed errors are at least 4 times below the bound
+# (checked up to n = 10⁶ for Float32 and Float64). Fixed-point results may in addition
+# round differently, by one quantum.
+kerneldata(k::ReshapedOneD) = k.data
+kerneldata(k) = k
+filterdim(::ReshapedOneD{T,N,Npre}) where {T,N,Npre} = Npre + 1
+filterdim(_) = 1
+function stagegrowth(k::SlidingKernel, n)
+    N = k.N
+    resonators = abs(KernelFactors.dccoef(k)) * (2N + 1) +
+                 sum(((c, ω),) -> abs(c) * (2N + 1) * min(1 / abs(sin(ω)), n), zip(k.c, k.ω); init = 0.0)
+    return resonators * sqrt(n) + (2N + 1) * sum(abs, k)
+end
+stagegrowth(k::AbstractArray, n) = length(k) * sum(abs, k)   # an FIR stage
+function growth(img, ks::Tuple)
+    stages = map(kerneldata, ks)
+    norms = map(k -> sum(abs, k), stages)
+    return sum(eachindex(stages)) do s
+        n = size(img, filterdim(ks[s])) + length(stages[s])   # the (virtually) padded line
+        stagegrowth(stages[s], n) * prod(i -> i == s ? 1.0 : norms[i], eachindex(norms))
+    end
+end
+growth(img, k::SlidingKernel) = growth(img, (k,))
+growth(img, L::SeparableSum) = sum(((t, w),) -> abs(w) * growth(img, t), zip(L.terms, L.weights))
+kerneltypes(ks::Tuple) = map(k -> eltype(kerneldata(k)), ks)
+kerneltypes(L::SeparableSum) = reduce((a, b) -> (a..., b...), map(kerneltypes, L.terms))
+kerneltypes(k) = (eltype(k),)
+# (all the element types in these tests are exactly representable as Float64)
+magnitude(x) = maximum(v -> isfinite(Float64(v)) ? abs(Float64(v)) : 0.0, channelview(x); init = 0.0)
+function filtertol(img, ks, border, out)
+    S = eltype(eltype(out))
+    ϵ = maximum(T -> eps(float(T)), (S, kerneltypes(ks)...))
+    X = max(magnitude(img), border isa Fill ? magnitude([border.value]) : 0.0)
+    atol = 4 * ϵ * X * growth(img, ks)
+    # NA() divides by the filtered mask (≥ 2^-D near corners) and filters twice
+    border isa NA && (atol *= 2^(ndims(img) + 1))
+    S <: FixedPoint && (atol += eps(S))
+    return atol, 4ϵ
+end
+function withintol(out, ref, atol, rtol)
+    axes(out) == axes(ref) || return false
+    return all(((a, b),) -> abs(Float64(a) - Float64(b)) <= atol + rtol * abs(Float64(b)), zip(channelview(out), channelview(ref)))
+end
+# `out` is the result of filtering `img` with `ks`, up to rounding, if `ref` is the exact one
+filtersmatch(out, ref, img, ks, border = "replicate") = withintol(out, ref, filtertol(img, ks, border, out)...)
+# Filtering `img` with the sliding kernels `ks` gives the result of direct (FIR) filtering
+# with the same kernels; if FIR filtering throws (e.g., "reflect" on an axis of length 1,
+# or Inner() with a kernel longer than the image), it throws the same error
+function agrees(img, ks, border = "replicate")
+    ref = try
+        imfilter(img, firkernel(ks), border, Algorithm.FIR())
+    catch err
+        return try imfilter(img, ks, border); false catch err2 typeof(err2) == typeof(err) end
+    end
+    out = imfilter(img, ks, border)
+    return eltype(out) == eltype(ref) && filtersmatch(out, ref, img, ks, border)
+end
+fir(img, ks, args...) = imfilter(img, firkernel(ks), args..., Algorithm.FIR())
+
 # Peak signal-to-noise ratio for images with values in [0, 1]
 psnr(a, ref) = 10 * log10(length(ref) / sum(abs2, a .- ref))
 # The untruncated sampled Gaussian, normalized
@@ -131,7 +200,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         for kind in (1, 3, 5, 7), K in (1, 3), σ in (1.5, 6.0)
             k = DCTGaussian(σ; K = K, kind = kind)
             for border in borders
-                @test imfilter(x, k, border) ≈ imfilter(x, firkernel(k), border, Algorithm.FIR()) atol = 1e-12
+                @test agrees(x, k, border)
             end
         end
         # n-d with various element types
@@ -143,13 +212,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
                 ks = DCTGaussian(σs; K = K, kind = kind)
                 for border in borders
                     border isa Fill && (border = Fill(zero(eltype(img))))
-                    # Inner() requires the image to be larger than the kernel
-                    border isa Inner && any(map((n, k) -> n < length(k.data), size(img), ks)) && continue
-                    out = imfilter(img, ks, border)
-                    ref = imfilter(img, firkernel(ks), border, Algorithm.FIR())
-                    @test eltype(out) == eltype(ref)
-                    @test axes(out) == axes(ref)
-                    @test maxabsdiff(out, ref) < rtol(out)
+                    @test agrees(img, ks, border)
                 end
             end
         end
@@ -159,83 +222,80 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         k3 = ntuple(d -> ReshapedOneD{3,d-1}(k), 3)
         for ks in (k3[1:1], k3[2:2], k3[1:2], k3)
             for border in borders
-                # Inner() requires the image to be larger than the kernel
-                border isa Inner && any(kk -> size(img, findfirst(!=(0:0), axes(kk))) < length(k), ks) && continue
                 # NA() requires one kernel per dimension
                 border isa NA && length(ks) < ndims(img) && continue
-                @test maxabsdiff(imfilter(img, ks, border), imfilter(img, firkernel(ks), border, Algorithm.FIR())) < 1e-12
+                @test agrees(img, ks, border)
             end
         end
         @test imfilter(Float64[], DCTGaussian(3.0)) == Float64[]
-        @test imfilter([2.0], DCTGaussian(3.0)) ≈ [2.0]
+        @test agrees([2.0], DCTGaussian(3.0)) && imfilter([2.0], DCTGaussian(3.0)) ≈ [2.0]
         # Offset arrays
         img = OffsetArray(rand(20, 30), -5:14, 3:32)
         ks = DCTGaussian((2.0, 3.0))
-        out = imfilter(img, ks, "reflect")
-        @test axes(out) == axes(img)
-        @test out ≈ imfilter(img, firkernel(ks), "reflect", Algorithm.FIR())
+        @test axes(imfilter(img, ks, "reflect")) == axes(img)
+        @test agrees(img, ks, "reflect")
         # Restricted output region and preallocated output
         img = rand(40, 40)
-        ref = imfilter(img, firkernel(ks), "symmetric", Algorithm.FIR())
+        ref = fir(img, ks, "symmetric")
         out = similar(img)
         @test imfilter!(out, img, ks, "symmetric") === out
-        @test out ≈ ref
+        @test filtersmatch(out, ref, img, ks)
         out = OffsetArray(zeros(10, 12), 11:20, 5:16)
         imfilter!(out, img, ks, "symmetric")
-        @test parent(out) ≈ ref[11:20, 5:16]
+        @test filtersmatch(parent(out), ref[11:20, 5:16], img, ks)
         # In-place filtering (one and several stages)
         for kk in (ks, ks[1:1], (ks..., ks...))
             img2 = copy(img)
             @test imfilter!(img2, img2, kk, "reflect") === img2
-            @test img2 ≈ imfilter(img, firkernel(kk), "reflect", Algorithm.FIR())
+            @test filtersmatch(img2, fir(img, kk, "reflect"), img, kk)
         end
         img3 = rand(15, 16, 17)
         k3 = DCTGaussian((2.0, 1.5, 2.5))
         for kk in (k3, k3[1:2], k3[2:3], k3[2:2])   # odd and even numbers of stages
             img4 = copy(img3)
             @test imfilter!(img4, img4, kk, "symmetric") === img4
-            @test img4 ≈ imfilter(img3, firkernel(kk), "symmetric", Algorithm.FIR())
+            @test filtersmatch(img4, fir(img3, kk, "symmetric"), img3, kk)
         end
         # Filtering along a single dimension
         out = similar(img)
         for border in ("replicate", Pad(:circular), Fill(0.5))
             @test imfilter!(CPU1(Algorithm.DCT()), out, img, ks[2].data, 2, border) === out
-            @test out ≈ imfilter(img, firkernel((ks[2],)), border, Algorithm.FIR())
+            @test filtersmatch(out, fir(img, (ks[2],), border), img, (ks[2],), border)
         end
         img2 = copy(img)
         imfilter!(CPU1(Algorithm.DCT()), img2, img2, ks[1].data, 1, "symmetric")
-        @test img2 ≈ imfilter(img, firkernel((ks[1],)), "symmetric", Algorithm.FIR())
+        @test filtersmatch(img2, fir(img, (ks[1],), "symmetric"), img, (ks[1],))
         @test_throws ArgumentError imfilter!(CPU1(Algorithm.DCT()), out, img, ks[1].data, 3, "symmetric")
         @test_throws DimensionMismatch imfilter!(CPU1(Algorithm.DCT()), zeros(3, 3), img, ks[1].data, 1, "symmetric")
         # Algorithm selection; all algorithms agree
         @test ImageFiltering.filter_algorithm(img, img, ks) == Algorithm.DCT()
         @test ImageFiltering.filter_algorithm(img, img, (ks[1], KernelFactors.gaussian((1.0, 1.0))[2])) != Algorithm.DCT()
-        @test imfilter(img, ks, "symmetric", Algorithm.DCT()) ≈ ref
-        @test imfilter(CPU1(Algorithm.DCT()), img, ks, Fill(0)) ≈ imfilter(img, firkernel(ks), Fill(0))
-        @test imfilter(CPU1(Algorithm.FIR()), img, ks) ≈ imfilter(img, firkernel(ks))
-        @test imfilter(img, ks, "replicate", Algorithm.FFT()) ≈ imfilter(img, firkernel(ks))
+        @test filtersmatch(imfilter(img, ks, "symmetric", Algorithm.DCT()), ref, img, ks)
+        @test filtersmatch(imfilter(CPU1(Algorithm.DCT()), img, ks, Fill(0)), fir(img, ks, Fill(0)), img, ks)
+        @test filtersmatch(imfilter(CPU1(Algorithm.FIR()), img, ks), fir(img, ks), img, ks)
+        # (the round-off of the FFT is of the same order as that of the recurrence here)
+        @test filtersmatch(imfilter(img, ks, "replicate", Algorithm.FFT()), fir(img, ks), img, ks)
         # Cascades mixing FIR and SlidingDCT kernels (and multiple DCT kernels along a dimension)
         kf = KernelFactors.gaussian((1.0, 2.0))
         ksd = DCTGaussian((3.0, 1.5))
         mixed = (kf[1], ksd[2], ksd[1], kf[2])
-        @test imfilter(img, mixed, "reflect") ≈ imfilter(img, (firkernel(mixed)...,), "reflect", Algorithm.FIR())
+        @test agrees(img, mixed, "reflect")
         for border in ("replicate", "reflect", Fill(0.3))
-            @test imfilter(img, (ksd[1], ksd[1]), border) ≈ imfilter(img, (firkernel(ksd[1]), firkernel(ksd[1])), border, Algorithm.FIR())
-            @test imfilter(img, (ksd[2], ksd[1], ksd[2]), border) ≈ imfilter(img, firkernel((ksd[2], ksd[1], ksd[2])), border, Algorithm.FIR())
+            @test agrees(img, (ksd[1], ksd[1]), border)
+            @test agrees(img, (ksd[2], ksd[1], ksd[2]), border)
         end
         # A Fill border must account for the sum of the kernels of previous stages
         kn = SlidingDCT(centered([1.0, 2.0, 3.0, 2.0, 1.0]); K = 3)   # sum(kn) == 9
         kn2 = kernelfactors((kn, kn))
-        @test imfilter(img, kn2, Fill(0.7)) ≈ imfilter(img, firkernel(kn2), Fill(0.7), Algorithm.FIR())
-        @test imfilter(img, (kn2[2], kn2[1]), Fill(0.7)) ≈ imfilter(img, firkernel((kn2[2], kn2[1])), Fill(0.7), Algorithm.FIR())
-        @test imfilter(img, (ksd..., ksd...), "circular") ≈ imfilter(img, firkernel((ksd..., ksd...)), "circular", Algorithm.FIR())
+        @test agrees(img, kn2, Fill(0.7))
+        @test agrees(img, (kn2[2], kn2[1]), Fill(0.7))
+        @test agrees(img, (ksd..., ksd...), "circular")
         # Integer images
-        imgi = rand(1:100, 30, 30)
-        @test imfilter(imgi, ksd) ≈ imfilter(imgi, firkernel(ksd))
+        @test agrees(rand(1:100, 30, 30), ksd)
         # NaN handling: with NA() missing values are ignored
         imgn = rand(60, 60); imgn[30, 30] = NaN
         @test !any(isnan, imfilter(imgn, ksd, NA()))
-        @test imfilter(imgn, ksd, NA()) ≈ imfilter(imgn, firkernel(ksd), NA(), Algorithm.FIR())
+        @test agrees(imgn, ksd, NA())
         # Otherwise, like for IIR filters, a NaN contaminates the remainder of each line
         # (unlike FIR filtering, which only contaminates the neighborhood)
         out, ref = imfilter(imgn, ksd), imfilter(imgn, firkernel(ksd), Algorithm.FIR())
@@ -245,10 +305,10 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
 
     @testset "properties" begin
         # constant images are unchanged
-        img = fill(0.7, 50, 60)
-        @test imfilter(img, DCTGaussian((5.0, 12.0))) ≈ img
-        img = fill(RGB{N0f8}(0.2, 0.4, 0.6), 30, 30)
-        @test imfilter(img, DCTGaussian((3.0, 3.0))) ≈ img
+        for (img, σs) in ((fill(0.7, 50, 60), (5.0, 12.0)), (fill(RGB{N0f8}(0.2, 0.4, 0.6), 30, 30), (3.0, 3.0)))
+            ks = DCTGaussian(σs)
+            @test filtersmatch(imfilter(img, ks), img, img, ks)
+        end
         # Accuracy with respect to an (essentially) exact Gaussian filter: a ±8σ window
         img = rand(200, 200)
         for σ in (2.0, 8.0, 25.0)
@@ -268,19 +328,21 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
     end
 
     @testset "numerical stability" begin
-        # Long signals: the recurrence must not accumulate significant round-off errors
+        # Long signals: the round-off errors of the recurrence must grow as a random walk
+        # (∝ √n, as assumed by `filtertol`), not linearly or exponentially
         x = rand(200_000)
-        for (σ, K, kind) in ((3.0, 3, 7), (50.0, 6, 7), (20.0, 4, 5), (20.0, 4, 1), (500.0, 3, 3))
-            k = DCTGaussian(σ; K = K, kind = kind)
-            out = imfilter(x, k, "reflect")
-            ref = imfilter(x, firkernel(k), "reflect", Algorithm.FIR())
-            @test maximum(abs, out - ref) < 1e-9
+        for (σ, K, kind, order) in ((3.0, 3, 7, 0), (50.0, 6, 7, 0), (20.0, 4, 5, 0), (20.0, 4, 1, 0), (500.0, 3, 3, 0),
+                                    (10.0, 4, 5, 1), (10.0, 5, 7, 2))
+            k = slidinggaussian(σ; K = K, kind = kind, order = order)
+            @test agrees(x, k, "reflect")
         end
-        k32 = DCTGaussian(10.0f0)
-        x32 = rand(Float32, 200_000)
-        out = imfilter(x32, k32)
-        @test eltype(out) == Float32
-        @test maximum(abs, out - imfilter(x32, firkernel(DCTGaussian(10.0)))) < 1e-3
+        # Float32: compare with the exact (Float64) filtering by the same Float32 kernel
+        for k32 in (DCTGaussian(10.0f0), slidinggaussian(10.0f0; order = 1), slidinggaussian(10.0f0; order = 2))
+            x32 = rand(Float32, 200_000)
+            out = imfilter(x32, k32)
+            @test eltype(out) == Float32
+            @test filtersmatch(out, fir(Float64.(x32), convert(SlidingKernel{Float64}, k32)), x32, k32)
+        end
     end
 
     @testset "derivatives" begin
@@ -300,21 +362,24 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         # accuracy with the default parameters, and improvement with K
         for σ in (3.0, 10.0), order in (1, 2)
             ref = sampledderivative(σ, order)
-            @test l2err(slidinggaussian(σ; order = order), ref) < 2e-2
+            # (the default K gives about the same relative accuracy as the Gaussian)
+            @test l2err(slidinggaussian(σ; order = order), ref) < 6e-3
             errs = [l2err(slidinggaussian(σ; order = order, K = K), ref) for K in 3:6]
             @test issorted(errs; rev = true)
         end
         @test slidinggaussian(3.0) == DCTGaussian(3.0)
-        @test slidinggaussian(3.0; order = 2) isa SlidingDCT{Float64,4}
+        @test slidinggaussian(3.0; order = 1) isa SlidingDST{Float64,4}
+        @test slidinggaussian(3.0; order = 2) isa SlidingDCT{Float64,5}
         @test eltype(slidinggaussian(3.0f0; order = 1)) == Float32
         # derivatives of polynomials, away from the borders
         t = collect(1.0:300.0)
         for σ in (2.0, 10.0)
             k1, k2 = slidinggaussian(σ; order = 1), slidinggaussian(σ; order = 2)
             inner = 6ceil(Int, σ):300-6ceil(Int, σ)
-            @test imfilter(3 .* t .- 7, k1)[inner] ≈ fill(3, length(inner))
-            @test imfilter(0.5 .* t .^ 2 .+ t, k2)[inner] ≈ fill(1, length(inner))
-            @test imfilter(0.5 .* t .^ 2 .+ t, k1)[inner] ≈ t[inner] .+ 1
+            lin, quad = 3 .* t .- 7, 0.5 .* t .^ 2 .+ t
+            @test filtersmatch(imfilter(lin, k1)[inner], fill(3, length(inner)), lin, k1)
+            @test filtersmatch(imfilter(quad, k2)[inner], fill(1, length(inner)), quad, k2)
+            @test filtersmatch(imfilter(quad, k1)[inner], t[inner] .+ 1, quad, k1)
         end
         # Tuples of kernels: gradients
         ks = slidinggaussian((2.0, 3.0); order = (1, 0))
@@ -340,7 +405,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         for kind in (1, 5), σ in (1.5, 6.0)
             k = slidinggaussian(σ; order = 1, kind = kind)
             for border in ("replicate", "circular", "symmetric", "reflect", Fill(0), Fill(0.25), Inner())
-                @test imfilter(x, k, border) ≈ imfilter(x, firkernel(k), border, Algorithm.FIR()) atol = 1e-12
+                @test agrees(x, k, border)
             end
         end
         for img in (rand(40, 50), rand(Gray{N0f8}, 30, 25), rand(RGB{Float32}, 20, 22, 9))
@@ -348,8 +413,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
             for order in ((1, ntuple(_ -> 0, ndims(img) - 1)...), (0, 2, ntuple(_ -> 0, ndims(img) - 2)...))
                 ks = slidinggaussian(σs; order = order)
                 for border in ("replicate", "reflect", Fill(zero(eltype(img))), Fill(oneunit(eltype(img))))
-                    out = imfilter(img, ks, border)
-                    @test maxabsdiff(out, imfilter(img, firkernel(ks), border, Algorithm.FIR())) < rtol(out)
+                    @test agrees(img, ks, border)
                 end
             end
         end
@@ -366,32 +430,33 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         @test occursin("SeparableSum of 2", sprint(show, L))
         @test_throws DimensionMismatch SeparableSum(((dx, ky), (kx, dy)), (1,))
         @test_throws DimensionMismatch SeparableSum(((dx, ky), (kx.data,)))
-        @test DCTLoG((2.0, 3.0), K0 = 3, K2 = 4).terms == L.terms
+        @test DCTLoG((2.0, 3.0)).terms == L.terms
+        @test DCTLoG((2.0, 3.0); K2 = 4).terms[1][1].data == slidinggaussian(2.0; order = 2, K = 4)
         # Filtering is the sum of the filtered terms, for all borders and algorithms
         img = rand(40, 45)
-        ref(border) = imfilter(img, firkernel((dx, ky)), border, Algorithm.FIR()) + imfilter(img, firkernel((kx, dy)), border, Algorithm.FIR())
+        ref(border) = fir(img, (dx, ky), border) + fir(img, (kx, dy), border)
+        @test fir(img, L, "reflect") ≈ ref("reflect")
         # (NA() is not meaningful for kernels that sum to zero, such as second derivatives)
-        for border in ("replicate", "circular", "symmetric", "reflect", Fill(0.5))
-            @test imfilter(img, L, border) ≈ ref(border)
+        for border in ("replicate", "circular", "symmetric", "reflect", Fill(0.5), Inner())
+            @test agrees(img, L, border)
         end
-        @test imfilter(img, L) ≈ ref("replicate")
+        @test filtersmatch(imfilter(img, L), ref("replicate"), img, L)
         out = imfilter(img, L, Inner())
         @test axes(out) == map(intersect, axes(imfilter(img, (dx, ky), Inner())), axes(imfilter(img, (kx, dy), Inner())))
-        @test out ≈ imfilter(img, firkernel((dx, ky)), Inner(), Algorithm.FIR())[axes(out)...] +
-                    imfilter(img, firkernel((kx, dy)), Inner(), Algorithm.FIR())[axes(out)...]
         @test imfilter(Float32, img, L) isa Matrix{Float32}
-        @test imfilter(CPU1(Algorithm.DCT()), img, L, "reflect") ≈ ref("reflect")
-        @test imfilter(CPU1(Algorithm.FIR()), Float64, img, L, "reflect") ≈ ref("reflect")
+        @test filtersmatch(imfilter(CPU1(Algorithm.DCT()), img, L, "reflect"), ref("reflect"), img, L)
+        @test filtersmatch(imfilter(CPU1(Algorithm.FIR()), Float64, img, L, "reflect"), ref("reflect"), img, L)
         out = similar(img)
         @test imfilter!(out, img, L, "reflect") === out
-        @test out ≈ ref("reflect")
-        @test imfilter!(CPU1(Algorithm.DCT()), out, img, L, Pad(:reflect)) ≈ ref("reflect")
+        @test filtersmatch(out, ref("reflect"), img, L)
+        @test filtersmatch(imfilter!(CPU1(Algorithm.DCT()), out, img, L, Pad(:reflect)), ref("reflect"), img, L)
         img2 = copy(img)
         imfilter!(img2, img2, L, "reflect")
-        @test img2 ≈ ref("reflect")
+        @test filtersmatch(img2, ref("reflect"), img, L)
         # Weights
         D = SeparableSum(((kx, ky), (dx, dy)), (2, -0.5))
-        @test imfilter(img, D, "reflect") ≈ 2 * imfilter(img, firkernel((kx, ky)), "reflect") - 0.5 * imfilter(img, firkernel((dx, dy)), "reflect")
+        @test agrees(img, D, "reflect")
+        @test fir(img, D, "reflect") ≈ 2 * fir(img, (kx, ky), "reflect") - 0.5 * fir(img, (dx, dy), "reflect")
         @test imfilter(rand(Gray{N0f8}, 20, 20), L) isa Matrix{Gray{Float64}}
 
         # Laplacian of Gaussian
@@ -402,8 +467,20 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
             # exact on quadratic images
             q = [0.5i^2 + 2j^2 + i for i in 1:80, j in 1:90]
             m = 6ceil(Int, σ)
-            @test imfilter(q, DCTLoG(σ))[m:end-m, m:end-m] ≈ fill(5, 81 - 2m, 91 - 2m)
+            @test filtersmatch(imfilter(q, DCTLoG(σ))[m:end-m, m:end-m], fill(5, 81 - 2m, 91 - 2m), q, DCTLoG(σ))
         end
+        # Accuracy with respect to the LoG of the untruncated sampled Gaussian
+        for σ in (2.0, 8.0)
+            d2, g0 = centered(sampledderivative(σ, 2).parent), centered(sampledgaussian(σ).parent)
+            exact = imfilter(img, kernelfactors((d2, g0)), "reflect") + imfilter(img, kernelfactors((g0, d2)), "reflect")
+            relerr(out) = sqrt(sum(abs2, out - exact) / sum(abs2, exact))
+            @test relerr(imfilter(img, DCTLoG(σ), "reflect")) < 1e-2
+            σ > 5 && @test relerr(imfilter(img, DCTLoG(σ), "reflect")) < relerr(imfilter(img, Kernel.LoG(σ), "reflect"))
+        end
+        # The terms are accumulated without (type-unstable) per-pixel overhead
+        imgf = rand(Float32, 200, 200)
+        imfilter(imgf, DCTLoG(3.0))
+        @test @allocated(imfilter(imgf, DCTLoG(3.0))) < 8 * sizeof(similar(imgf, Float64))
         img3 = rand(30, 31, 32)
         ref = imfilter(img3, Kernel.LoG((2.0, 2.5, 3.0)), "reflect")
         @test maximum(abs, imfilter(img3, DCTLoG((2.0, 2.5, 3.0)), "reflect") - ref) < 3e-2 * maximum(abs, ref)
@@ -418,6 +495,83 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         end
         @test DCTDoG((2.0, 3.0)).terms[2] == DCTGaussian((2 * √2, 3 * √2))
         @test DCTDoG((2.0, 3.0), (4.0, 5.0)).weights == (true, -1)
+    end
+
+    @testset "edge cases" begin
+        borders = ("replicate", "circular", "symmetric", "reflect", Fill(0), Fill(0.25), Inner(), NA())
+        k0, k1, k2 = DCTGaussian(2.5), slidinggaussian(2.5; order = 1), slidinggaussian(2.5; order = 2)
+        N = k0.N
+        # Axes shorter than (or close to) the kernel length 2N+1
+        for k in (k0, k1, k2), n in unique((1, 2, 3, N - 1, N, N + 1, 2N, 2N + 1, 2N + 2)), border in borders
+            border isa NA && k !== k0 && continue   # (NA() normalizes by the sum of the kernel)
+            @test agrees(rand(n), k, border)
+            @test agrees(rand(n, 7), kernelfactors((k, DCTGaussian(1.5))), border)
+        end
+        # Impulses at and near the boundaries expose off-by-one and sign errors in the
+        # virtual padding
+        n = 3N + 4
+        for k in (k0, k1, k2), p in unique((1, 2, N, N + 1, N + 2, n - N - 1, n - N, n - 1, n)), border in borders
+            border isa NA && continue
+            x = zeros(n); x[p] = 1
+            @test agrees(x, k, border)
+            img = zeros(n, n); img[p, n+1-p] = 1
+            @test agrees(img, kernelfactors((k, k)), border)
+        end
+        # An interior impulse gives the reversed kernel (imfilter computes a correlation),
+        # and with Fill(0) an impulse at the edge gives the truncated kernel
+        for k in (k0, k1, k2)
+            Nk = k.N
+            x = zeros(4Nk + 1); x[2Nk+1] = 1
+            @test filtersmatch(imfilter(x, k, Fill(0)), [zeros(Nk); [k[-r] for r in -Nk:Nk]; zeros(Nk)], x, k)
+            x = zeros(2Nk); x[1] = 1
+            @test filtersmatch(imfilter(x, k, Fill(0))[1:Nk+1], [k[-r] for r in 0:Nk], x, k)
+        end
+        # Kernels that are not Gaussians: arbitrary coefficients and (non-harmonic) frequencies
+        kd = SlidingDCT(9, SVector(0.3, -0.2, 0.05), SVector(0.21, 0.83, 1.7), 0.1, true)
+        ks = SlidingDST(9, SVector(0.4, 0.1), SVector(0.35, 2.2))
+        kd32 = convert(SlidingKernel{Float32}, kd)
+        box = SlidingDCT(centered(fill(1 / 11, 11)); K = 4)                      # fitted box filter
+        tri = SlidingDCT(centered([1.0, 2, 3, 4, 5, 4, 3, 2, 1] / 25); K = 2)    # fitted triangle
+        hat = SlidingDCT(centered([(1 - r^2 / 9) * exp(-r^2 / 18) for r in -12.0:12.0]); K = 4)  # "Mexican hat"
+        ramp = SlidingDST(centered(collect(-6.0:6.0)); K = 3, kind = 1)          # fitted odd ramp
+        @test kd[3] ≈ 0.1 + 0.3cos(0.63) - 0.2cos(2.49) + 0.05cos(5.1)
+        @test ks[-3] ≈ -(0.4sin(1.05) + 0.1sin(6.6))
+        x = rand(60)
+        img = rand(Float32, 30, 40)
+        for k in (kd, ks, kd32, box, tri, hat, ramp), border in borders
+            border isa NA && continue
+            @test agrees(x, k, border)
+            @test agrees(img, kernelfactors((k, kd)), border)
+        end
+        @test agrees(img, (kernelfactors((kd, ks))..., kernelfactors((box, ramp))...), "reflect")
+        # SubArrays (contiguous and strided), as input and as output
+        A = rand(50, 60, 3)
+        ks2 = slidinggaussian((2.0, 3.5); order = (1, 0))
+        for v in (view(A, :, :, 2), view(A, 3:45, 10:50, 1), view(A, 1:2:49, 60:-2:1, 3), view(A, :, 2, :)')
+            for border in ("replicate", "reflect", Fill(0.5), Inner())
+                @test agrees(v, ks2, border)
+                @test agrees(v, DCTGaussian((3.0, 2.0)), border)
+            end
+            @test agrees(v, DCTLoG(2.0))
+            @test imfilter(v, DCTLoG(2.0)) == imfilter(copy(v), DCTLoG(2.0))
+        end
+        @test agrees(view(A, 1:2:50, :, :), DCTGaussian((1.5, 2.0, 1.0)), "symmetric")
+        @test agrees(view(rand(100), 2:3:100), k1, "reflect")
+        B = zeros(70, 80)
+        out = view(B, 11:60, 11:70)
+        img = rand(50, 60)
+        @test imfilter!(out, img, ks2, "reflect") === out
+        @test filtersmatch(out, fir(img, ks2, "reflect"), img, ks2)
+        @test all(iszero, B[1:10, :]) && all(iszero, B[:, 71:80])
+        # in place, on a view
+        C = rand(60, 60); C0 = copy(C)
+        v = view(C, 5:54, 6:55)
+        imfilter!(v, v, ks2, "symmetric")
+        @test filtersmatch(v, fir(C0[5:54, 6:55], ks2, "symmetric"), v, ks2)
+        @test C[1:4, :] == C0[1:4, :]
+        # NA() on a view
+        V = view(rand(60, 60), 5:54, :); V[10, 10] = NaN
+        @test agrees(V, DCTGaussian((2.0, 2.0)), NA())
     end
 
     @testset "inference" begin

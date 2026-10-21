@@ -878,8 +878,10 @@ and the second moment for `order = 0` and `2`, the first and third moments for
 `order = 1` (only the lowest one if `K = 1`). Consequently, constant images are
 unchanged by the Gaussian and the derivatives are exact for polynomials of low degree.
 
-Increasing `K` improves the accuracy at the cost of speed. The defaults are `K = 3`
-for `order` 0 and 1, and `K = 4` for `order = 2`. The relative L2 error of the kernel
+Increasing `K` improves the accuracy at the cost of speed. A derivative needs one
+more term than the Gaussian for the same relative accuracy, so the defaults are
+`K = 3`, `4` and `5` for `order = 0`, `1` and `2`, respectively, which give a relative
+error of about `5e-3` for all orders. The relative L2 error of the kernel
 with respect to the untruncated sampled Gaussian (derivative) is at most (for
 `2 ≤ σ ≤ 64`, with the default `kind` and `N`):
 
@@ -955,7 +957,7 @@ function _slidinggaussian(::Type{T}, σ::Real, order::Integer, K, N, kind, emit_
         order == 0 || throw(ArgumentError("σ must be positive for the derivatives of a Gaussian"))
         return SlidingDCT(0, SVector{0,T}(), SVector{0,T}(), one(T), true)  # the identity kernel
     end
-    K = something(K, order == 2 ? 4 : 3)
+    K = something(K, 3 + order)
     odd = isodd(order)
     kind = something(kind, odd ? 5 : 7)
     emit_warning && σ < 1 && @warn("σ is too small for accuracy")
@@ -1055,7 +1057,7 @@ function Base.show(io::IO, kernel::SeparableSum{N}) where {N}
 end
 
 """
-    DCTLoG([T], σ; K0 = 3, K2 = 4, emit_warning = true)
+    DCTLoG([T], σ; K0 = 3, K2 = 5, emit_warning = true)
 
 Construct a constant-time approximation of the Laplacian of Gaussian
 `∇²G = Σ_d ∂²G/∂x_d²`, as a [`KernelFactors.SeparableSum`](@ref) whose `d`-th term
@@ -1066,7 +1068,7 @@ or a tuple with one value per dimension (as for [`Kernel.LoG`](@ref)).
 `K2` and `K0` are the number of terms of the second-derivative and Gaussian
 factors, respectively: see [`KernelFactors.slidinggaussian`](@ref).
 """
-function DCTLoG(::Type{T}, σs::NTuple{D,Real}; K0::Integer = 3, K2::Integer = 4, emit_warning::Bool = true) where {T,D}
+function DCTLoG(::Type{T}, σs::NTuple{D,Real}; K0::Integer = 3, K2::Integer = 5, emit_warning::Bool = true) where {T,D}
     gs = ntuple(d -> _slidinggaussian(T, σs[d], 0, K0, nothing, nothing, emit_warning), Val(D))
     g2s = ntuple(d -> _slidinggaussian(T, σs[d], 2, K2, nothing, nothing, emit_warning), Val(D))
     SeparableSum(ntuple(d -> kernelfactors(ntuple(i -> i == d ? g2s[i] : gs[i], Val(D))), Val(D)))
