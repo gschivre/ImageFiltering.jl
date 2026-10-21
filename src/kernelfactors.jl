@@ -694,7 +694,7 @@ Base.size(kernel::SlidingKernel) = (2 * kernel.N + 1,)
 end
 
 """
-    SlidingDCT(h; K = 3, kind = 7, moments = K >= 2 ? (0, 2) : (0,))
+    SlidingDCT(h; K = 4, kind = 5, moments = K >= 2 ? (0, 2) : (0,))
 
 Approximate the even, centered kernel `h` (with axes `-N:N`) by a sum of `K`
 discrete cosine transform (DCT) basis functions, so that filtering with it can
@@ -716,8 +716,11 @@ without spatial phase shift:
 | `5`    | `2πk/(2N+1)`           |
 | `7`    | `π(2k+1)/(2N+1)`       |
 
-DCT-3 and DCT-7 (the default) do not contain a constant term and are usually
-the most accurate for a given `K`.
+DCT-1 and DCT-5 (the default) contain a constant term (`k = 0`), which is computed
+as a running sum: it costs much less than an oscillating term, and does not
+accumulate rounding errors. For the same cost, i.e., the same number of oscillating
+terms, they are usually more accurate than DCT-3 and DCT-7, which is why the default
+is DCT-5 with `K = 4` (3 cosines and the constant term), as in Sugimoto & Kamata (2015).
 
 The element type of the result matches `float(eltype(h))`.
 
@@ -733,12 +736,12 @@ Conference on Acoustics, Speech and Signal Processing (ICASSP), 1498-1502 (2018)
 
 See also: [`KernelFactors.SlidingDST`](@ref), [`KernelFactors.slidinggaussian`](@ref).
 """
-function SlidingDCT(h::AbstractVector; K::Integer = 3, kind::Integer = 7, moments = K >= 2 ? (0, 2) : (0,))
+function SlidingDCT(h::AbstractVector; K::Integer = 4, kind::Integer = 5, moments = K >= 2 ? (0, 2) : (0,))
     return slidingfit(h, K, kind, moments, false)
 end
 
 """
-    SlidingDST(h; K = 3, kind = 5, moments = K >= 2 ? (1, 3) : (1,))
+    SlidingDST(h; K = 3, kind = 5, moments = (1,))
 
 Approximate the odd, centered kernel `h` (with axes `-N:N`) by a sum of `K`
 discrete sine transform (DST) basis functions, so that filtering with it can be
@@ -747,7 +750,9 @@ performed in constant time per pixel, independent of `N`.
 The coefficients are the least-squares fit of `h` subject to exactly preserving
 the moments `Σᵣ rᵐ h[r]` for each (odd) order `m` listed in `moments`; pass
 `moments = ()` for an unconstrained least-squares fit. Preserving the first
-moment of a derivative kernel makes the filter exact on linear signals.
+moment of a derivative kernel makes the filter exact on polynomials of degree up
+to 2 (the even moments of an odd kernel vanish), as the default moments of
+[`KernelFactors.SlidingDCT`](@ref) do for even kernels.
 
 `kind` selects the DST basis, i.e., the frequencies `ωₖ`:
 
@@ -765,7 +770,7 @@ The element type of the result matches `float(eltype(h))`.
 
 See also: [`KernelFactors.SlidingDCT`](@ref), [`KernelFactors.slidinggaussian`](@ref).
 """
-function SlidingDST(h::AbstractVector; K::Integer = 3, kind::Integer = 5, moments = K >= 2 ? (1, 3) : (1,))
+function SlidingDST(h::AbstractVector; K::Integer = 3, kind::Integer = 5, moments = (1,))
     return slidingfit(h, K, kind, moments, true)
 end
 
@@ -874,26 +879,28 @@ correlation).
 
 The kernel is the least-squares approximation, on `-N:N`, of the sampled Gaussian
 (derivative) by `K` terms, constrained to preserve its low-order moments: the sum
-and the second moment for `order = 0` and `2`, the first and third moments for
-`order = 1` (only the lowest one if `K = 1`). Consequently, constant images are
-unchanged by the Gaussian and the derivatives are exact for polynomials of low degree.
+and the second moment for `order = 0` and `2` (only the second one if `K = 1` for
+`order = 2`), and the first moment for `order = 1`. Consequently, constant images are
+unchanged by the Gaussian, and the derivatives are exact for polynomials of degree up
+to 2 (e.g., the LoG of a quadratic image is exact).
 
-Increasing `K` improves the accuracy at the cost of speed. A derivative needs one
-more term than the Gaussian for the same relative accuracy, so the defaults are
-`K = 3`, `4` and `5` for `order = 0`, `1` and `2`, respectively, which give a relative
-error of about `5e-3` for all orders. The relative L2 error of the kernel
-with respect to the untruncated sampled Gaussian (derivative) is at most (for
-`2 ≤ σ ≤ 64`, with the default `kind` and `N`):
-
-| `K`         | 2      | 3      | 4      | 5      | 6      |
-|:-----------:|:------:|:------:|:------:|:------:|:------:|
-| `order = 0` | `5e-2` | `5e-3` | `1.4e-3` | `2.3e-4` | `6e-5` |
-| `order = 1` | `1.3e-1` | `1.7e-2` | `5e-3` | `5.6e-4` | `1.6e-4` |
-| `order = 2` | `2.5e-1` | `1e-1` | `1.8e-2` | `5.3e-3` | `1.2e-3` |
-
-Even orders use a DCT-7 basis and odd orders a DST-5 basis by default (see
+Even orders use a DCT-5 basis and odd orders a DST-5 basis by default (see
 [`KernelFactors.SlidingDCT`](@ref) and [`KernelFactors.SlidingDST`](@ref) for the
-other choices of `kind`).
+other choices of `kind`). `K` counts all the terms, including the constant term of the
+DCT-5, which is nearly free; the cost is that of the oscillating terms (`K - 1` for even
+orders, `K` for odd orders). Increasing `K` improves the accuracy at the cost of speed.
+The second derivative needs more terms than the Gaussian for the same relative
+accuracy, so the defaults are `K = 4`, `4` and `6` for `order = 0`, `1` and `2` (3, 4
+and 5 oscillating terms), which give similar accuracies for all orders. The signal-to-error ratio
+of the kernel `ĥ`, `10 log₁₀(‖h‖² / ‖ĥ - h‖²)` with respect to the untruncated sampled
+Gaussian (derivative) `h`, is at least (in dB, for `2 ≤ σ ≤ 64`, with the default `kind`
+and `N`):
+
+| oscillating terms           | 2    | 3    | 4    | 5    | 6    |
+|:---------------------------:|:----:|:----:|:----:|:----:|:----:|
+| `order = 0` (`K` = terms + 1) | 35.8 | 50.6 | 67.0 | 81.0 | 94.0 |
+| `order = 1` (`K` = terms)     | 22.5 | 37.2 | 50.9 | 64.7 | 77.1 |
+| `order = 2` (`K` = terms + 1) | 16.3 | 27.5 | 42.3 | 53.9 | 66.4 |
 
 Unless specified, the radius `N` minimizes the L2 (energy) error of the kernel with
 respect to the untruncated Gaussian (derivative), which balances the truncation of
@@ -957,9 +964,9 @@ function _slidinggaussian(::Type{T}, σ::Real, order::Integer, K, N, kind, emit_
         order == 0 || throw(ArgumentError("σ must be positive for the derivatives of a Gaussian"))
         return SlidingDCT(0, SVector{0,T}(), SVector{0,T}(), one(T), true)  # the identity kernel
     end
-    K = something(K, 3 + order)
+    K = something(K, order == 2 ? 6 : 4)
     odd = isodd(order)
-    kind = something(kind, odd ? 5 : 7)
+    kind = something(kind, 5)
     emit_warning && σ < 1 && @warn("σ is too small for accuracy")
     # The (untruncated) sampled Gaussian (derivative) and its moments
     Tf = promote_type(T, Float64)
@@ -968,7 +975,7 @@ function _slidinggaussian(::Type{T}, σ::Real, order::Integer, K, N, kind, emit_
     g ./= sum(g)
     s2 = Tf(σ)^2
     h = OffsetArray(order == 0 ? g : order == 1 ? (-M:M) .* g ./ s2 : ((-M:M) .^ 2 .- s2) .* g ./ s2^2, -M:M)
-    orders = order == 0 ? (0, 2) : order == 1 ? (1, 3) : (0, 2)
+    orders = order == 1 ? (1,) : (0, 2)
     orders = K >= 2 ? orders : order == 2 ? (2,) : orders[1:1]
     μ = map(m -> (m, sum(r -> Tf(r)^m * h[r], -M:M)), orders)
     fit(n) = slidingfit(Tf, r -> h[r], n, K, kind, μ, odd)
@@ -983,7 +990,7 @@ function _slidinggaussian(::Type{T}, σ::Real, order::Integer, K, N, kind, emit_
 end
 
 """
-    DCTGaussian([T], σ; K = 3, N, kind = 7, emit_warning = true)
+    DCTGaussian([T], σ; K = 4, N, kind = 5, emit_warning = true)
 
 Construct a constant-time approximation of a Gaussian of standard deviation `σ`.
 This is equivalent to `slidinggaussian([T], σ; order = 0, ...)`: see
@@ -995,9 +1002,10 @@ give one value per dimension, e.g., `DCTGaussian((σ, σ))` for an image.
 
 The approximation is much more accurate than [`KernelFactors.IIRGaussian`](@ref),
 for a similar speed: on images, the peak signal-to-noise ratio of the result with
-respect to an exact Gaussian filter is 15 to 30 dB higher with the default `K = 3`
-(for `1 ≤ σ ≤ 64`). The maximal error of the kernel, relative to its peak, is at most
-`6e-2`, `5e-3`, `1.3e-3`, `2e-4` and `6e-5` for `K = 2, …, 6` (for `2 ≤ σ ≤ 64`).
+respect to an exact Gaussian filter is 30 to 50 dB higher with the default `K = 4`
+(for `1 ≤ σ ≤ 64`). The signal-to-error ratio of the kernel is at least 36, 51, 67,
+81 and 94 dB for `K = 3, …, 7` (for `2 ≤ σ ≤ 64`; see
+[`KernelFactors.slidinggaussian`](@ref)).
 
 # Examples
 
@@ -1057,7 +1065,7 @@ function Base.show(io::IO, kernel::SeparableSum{N}) where {N}
 end
 
 """
-    DCTLoG([T], σ; K0 = 3, K2 = 5, emit_warning = true)
+    DCTLoG([T], σ; K0 = 4, K2 = 6, emit_warning = true)
 
 Construct a constant-time approximation of the Laplacian of Gaussian
 `∇²G = Σ_d ∂²G/∂x_d²`, as a [`KernelFactors.SeparableSum`](@ref) whose `d`-th term
@@ -1068,7 +1076,7 @@ or a tuple with one value per dimension (as for [`Kernel.LoG`](@ref)).
 `K2` and `K0` are the number of terms of the second-derivative and Gaussian
 factors, respectively: see [`KernelFactors.slidinggaussian`](@ref).
 """
-function DCTLoG(::Type{T}, σs::NTuple{D,Real}; K0::Integer = 3, K2::Integer = 5, emit_warning::Bool = true) where {T,D}
+function DCTLoG(::Type{T}, σs::NTuple{D,Real}; K0::Integer = 4, K2::Integer = 6, emit_warning::Bool = true) where {T,D}
     gs = ntuple(d -> _slidinggaussian(T, σs[d], 0, K0, nothing, nothing, emit_warning), Val(D))
     g2s = ntuple(d -> _slidinggaussian(T, σs[d], 2, K2, nothing, nothing, emit_warning), Val(D))
     SeparableSum(ntuple(d -> kernelfactors(ntuple(i -> i == d ? g2s[i] : gs[i], Val(D))), Val(D)))
@@ -1078,8 +1086,8 @@ DCTLoG(::Type{T}, σ::Real; kwargs...) where {T} = DCTLoG(T, (σ, σ); kwargs...
 DCTLoG(σ::Real; kwargs...) = DCTLoG((σ, σ); kwargs...)
 
 """
-    DCTDoG([T], σp, σm; K = 3, emit_warning = true)
-    DCTDoG([T], σ; K = 3, emit_warning = true)
+    DCTDoG([T], σp, σm; K = 4, emit_warning = true)
+    DCTDoG([T], σ; K = 4, emit_warning = true)
 
 Construct a constant-time approximation of the difference of Gaussians
 `G(σp) - G(σm)`, as a [`KernelFactors.SeparableSum`](@ref). `σp` and `σm` are tuples
@@ -1088,7 +1096,7 @@ with one value per dimension; when a single `σ` is supplied, `σp = σ` and
 [`Kernel.DoG`](@ref)). `K` is the number of terms of each Gaussian factor: see
 [`KernelFactors.slidinggaussian`](@ref).
 """
-function DCTDoG(::Type{T}, σps::NTuple{D,Real}, σms::NTuple{D,Real}; K::Integer = 3, emit_warning::Bool = true) where {T,D}
+function DCTDoG(::Type{T}, σps::NTuple{D,Real}, σms::NTuple{D,Real}; K::Integer = 4, emit_warning::Bool = true) where {T,D}
     SeparableSum((slidinggaussian(T, σps; K = K, emit_warning = emit_warning),
                   slidinggaussian(T, σms; K = K, emit_warning = emit_warning)), (true, -1))
 end

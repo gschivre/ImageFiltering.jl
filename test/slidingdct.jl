@@ -122,11 +122,13 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         σ = 10.0
         g = sampledgaussian(σ)
         kerr(k, p) = (r = axes(g, 1); e = [(abs(i) <= k.N ? k[i] : 0.0) - g[i] for i in r]; p == Inf ? maximum(abs, e) / g[0] : sqrt(sum(abs2, e) / sum(abs2, g)))
-        errs = [kerr(DCTGaussian(σ; K = K), Inf) for K in 2:6]
+        errs = [kerr(DCTGaussian(σ; K = K), Inf) for K in 3:7]
         @test issorted(errs; rev = true)
-        @test errs[2] < 5e-3      # K = 3, the default
-        @test errs[end] < 1e-4    # K = 6
+        @test errs[2] < 3e-3      # K = 4, the default
+        @test errs[end] < 3e-5    # K = 7
         @test kerr(DCTGaussian(σ), Inf) == errs[2]
+        # The default is DCT-5: 3 cosines and the constant term
+        @test DCTGaussian(3.0) isa SlidingDCT{Float64,3,true}
         # The default radius minimizes the L2 error
         for σ in (1.5, 3.0, 10.0), K in (2, 3, 5), kind in (5, 7)
             g = sampledgaussian(σ)
@@ -188,7 +190,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         N = 12
         ω = [π * (2k + 1) / (2N + 1) for k in 0:2]
         hc = OffsetArray([0.3cos(ω[1] * r) - 0.2cos(ω[2] * r) + 0.1cos(ω[3] * r) for r in -N:N], -N:N)
-        kc = SlidingDCT(hc; K = 3, moments = ())
+        kc = SlidingDCT(hc; K = 3, kind = 7, moments = ())
         @test kc.c ≈ [0.3, -0.2, 0.1]
         @test collect(kc) ≈ collect(hc)
     end
@@ -314,12 +316,12 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         for σ in (2.0, 8.0, 25.0)
             l = 2 * ceil(Int, 8σ) + 1
             ref = imfilter(img, KernelFactors.gaussian((σ, σ), (l, l)), "replicate", Algorithm.FFT())
-            p3 = psnr(imfilter(img, DCTGaussian((σ, σ)), "replicate"), ref)
-            p5 = psnr(imfilter(img, DCTGaussian((σ, σ); K = 5), "replicate"), ref)
+            p4 = psnr(imfilter(img, DCTGaussian((σ, σ)), "replicate"), ref)   # the default, K = 4
+            p6 = psnr(imfilter(img, DCTGaussian((σ, σ); K = 6), "replicate"), ref)
             piir = psnr(imfilter(img, KernelFactors.IIRGaussian((σ, σ)), "replicate"), ref)
-            @test p3 > 70
-            @test p5 > 95
-            @test p3 > piir + 15   # substantially more accurate than IIRGaussian
+            @test p4 > 72
+            @test p6 > 105
+            @test p4 > piir + 25   # substantially more accurate than IIRGaussian
         end
         # the input is not modified
         img = rand(20, 20); img0 = copy(img)
@@ -362,14 +364,14 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         # accuracy with the default parameters, and improvement with K
         for σ in (3.0, 10.0), order in (1, 2)
             ref = sampledderivative(σ, order)
-            # (the default K gives about the same relative accuracy as the Gaussian)
+            # (the default K gives an accuracy similar to that of the Gaussian)
             @test l2err(slidinggaussian(σ; order = order), ref) < 6e-3
             errs = [l2err(slidinggaussian(σ; order = order, K = K), ref) for K in 3:6]
             @test issorted(errs; rev = true)
         end
         @test slidinggaussian(3.0) == DCTGaussian(3.0)
         @test slidinggaussian(3.0; order = 1) isa SlidingDST{Float64,4}
-        @test slidinggaussian(3.0; order = 2) isa SlidingDCT{Float64,5}
+        @test slidinggaussian(3.0; order = 2) isa SlidingDCT{Float64,5,true}   # K = 6: 5 cosines and the constant term
         @test eltype(slidinggaussian(3.0f0; order = 1)) == Float32
         # derivatives of polynomials, away from the borders
         t = collect(1.0:300.0)
@@ -385,7 +387,7 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         ks = slidinggaussian((2.0, 3.0); order = (1, 0))
         @test ks[1].data isa SlidingDST && ks[2].data isa SlidingDCT
         @test ks[2].data == DCTGaussian(3.0)
-        @test slidinggaussian((2.0, 3.0); order = (0, 2), K = (3, 5))[2].data isa SlidingDCT{Float64,5}
+        @test slidinggaussian((2.0, 3.0); order = (0, 2), K = (3, 5))[2].data isa SlidingDCT{Float64,4,true}   # 4 cosines + constant
         @test_throws DimensionMismatch slidinggaussian((2.0, 3.0); order = (1, 0, 0))
         @test_throws ArgumentError slidinggaussian(3.0; order = 3)
         @test_throws ArgumentError slidinggaussian(0; order = 1)
@@ -572,6 +574,58 @@ l2err(k, ref) = sqrt(sum(r -> abs2((r in axes(k, 1) ? k[r] : 0.0) - ref[r]), axe
         # NA() on a view
         V = view(rand(60, 60), 5:54, :); V[10, 10] = NaN
         @test agrees(V, DCTGaussian((2.0, 2.0)), NA())
+    end
+
+    @testset "multithreading" begin
+        # The blocks of lines given to the tasks partition the lines
+        for (Rpre, Rpost) in ((CartesianIndices(()), CartesianIndices((1:7, 0:4))), (CartesianIndices((1:100,)), CartesianIndices(())),
+                              (CartesianIndices((1:5, 2:9)), CartesianIndices((3,))), (CartesianIndices((1:10,)), CartesianIndices((2,))),
+                              (CartesianIndices(()), CartesianIndices(())))
+            for ntasks in (1, 2, 3, 8)
+                blocks = ImageFiltering._dct_blocks(Rpre, Rpost, ntasks)
+                @test 1 <= length(blocks) <= ntasks
+                lines = [(Ipre, Ipost) for (Bpre, Bpost) in blocks for Ipre in Bpre for Ipost in Bpost]
+                @test sort(lines) == sort(vec([(Ipre, Ipost) for Ipre in Rpre, Ipost in Rpost]))
+                # blocks along the (contiguous) first dimension keep at least 16 lines
+                if ndims(Rpre) == 1 && length(unique(first.(blocks))) > 1
+                    @test all(b -> length(b[1]) >= 16, blocks)
+                end
+            end
+        end
+        # Filtering by several tasks gives exactly the serial result. CI runs on a single
+        # thread, so we call the task-based function directly with several tasks.
+        img = rand(Float32, 70, 45, 3)
+        for ks in (DCTGaussian((2.0, 3.0, 1.5)), slidinggaussian((2.0, 3.0, 1.5); order = (1, 0, 2)))
+            for k in ks
+                Rpre, ind, Rpost = KernelFactors.iterdims(axes(img), k)
+                N = k.data.N
+                pidx = ImageFiltering.padindex(Pad(:reflect), N, UnitRange(ind), N)
+                O0pre, O0post = zero(eltype(Rpre)), zero(eltype(Rpost))
+                serial = ImageFiltering._imfilter_dct!(similar(img), img, k.data, Rpre, ind, Rpost, pidx, nothing, O0pre, O0post)
+                for ntasks in (2, 4, 7)
+                    @test ImageFiltering._imfilter_dct_tasks!(ntasks, similar(img), img, k.data, Rpre, ind, Rpost, pidx, nothing, O0pre, O0post) == serial
+                end
+            end
+        end
+        # Through the API (with several threads if Julia was started with them),
+        # CPUThreads gives exactly the CPU1 result (or the same error), along every path
+        rt, r1 = CPUThreads(Algorithm.DCT()), CPU1(Algorithm.DCT())
+        result(r, args...) = try imfilter(r, args...) catch err typeof(err) end
+        for img in (rand(300, 250), rand(RGB{N0f8}, 30, 40), rand(40, 41, 42), rand(20, 21, 22), rand(70_000))
+            ks = ndims(img) == 1 ? slidinggaussian(3.0; order = 1) : slidinggaussian(ntuple(d -> 1.0 + d, ndims(img)); order = ntuple(d -> d == 1 ? 1 : 0, ndims(img)))
+            for border in ("replicate", "symmetric", Fill(zero(eltype(img))), Inner(), NA())
+                @test result(rt, img, ks, border) == result(r1, img, ks, border)
+            end
+        end
+        img = rand(300, 250)
+        L = DCTLoG(2.0)
+        @test imfilter(rt, img, L) == imfilter(r1, img, L)
+        ks = DCTGaussian((2.0, 3.0))
+        @test imfilter!(rt, similar(img), img, ks[2].data, 2, "reflect") == imfilter!(r1, similar(img), img, ks[2].data, 2, "reflect")
+        img2, img3 = copy(img), copy(img)
+        @test imfilter!(rt, img2, img2, ks, Pad(:reflect)) == imfilter!(r1, img3, img3, ks, Pad(:reflect))
+        # As for FIRTiled, multiple threads are used by default when available
+        @test ImageFiltering.default_resource(Algorithm.DCT()) == (Threads.nthreads() > 1 ? rt : r1)
     end
 
     @testset "inference" begin

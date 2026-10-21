@@ -1136,7 +1136,7 @@ function imfilter!(r::AbstractResource{DCT},
     tmp = nstages > 1 ? similar(out) : out
     dst = isodd(nstages) ? out : tmp
     for kern in kernN
-        _imfilter_dct_virtual!(dst, src, kern, border)
+        _imfilter_dct_virtual!(r, dst, src, kern, border)
         # After filtering, the (virtual) padding along the remaining dimensions has
         # been filtered too: a constant fill value gets multiplied by the kernel sum
         border = _filtered_border(border, kern)
@@ -1175,53 +1175,100 @@ function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, 
     axes(out) == axes(img) || throw(DimensionMismatch("output axes $(axes(out)) must match the input axes $(axes(img))"))
     src = out === img ? copy(img) : img   # inplace filtering
     inds = axes(img)
-    _imfilter_dct_line!(out, src, kernel, CartesianIndices(inds[1:dim-1]), inds[dim], CartesianIndices(inds[dim+1:end]), border)
+    _imfilter_dct_line!(r, out, src, kernel, CartesianIndices(inds[1:dim-1]), inds[dim], CartesianIndices(inds[dim+1:end]), border)
 end
 function imfilter!(r::AbstractResource, out::AbstractArray, img::AbstractArray, kernel::SlidingKernel, dim::Integer, border::AbstractString)
     imfilter!(r, out, img, kernel, dim, Pad(Symbol(border)))
 end
 
-function _imfilter_dct_virtual!(out, img, kern::ReshapedSliding, border)
+function _imfilter_dct_virtual!(r, out, img, kern::ReshapedSliding, border)
     Rpre, ind, Rpost = iterdims(axes(img), kern)
-    _imfilter_dct_line!(out, img, kern.data, Rpre, ind, Rpost, border)
+    _imfilter_dct_line!(r, out, img, kern.data, Rpre, ind, Rpost, border)
 end
-function _imfilter_dct_virtual!(out, img::AbstractVector, kern::SlidingKernel, border)
-    _imfilter_dct_line!(out, img, kern, CartesianIndices(()), axes(img, 1), CartesianIndices(()), border)
+function _imfilter_dct_virtual!(r, out, img::AbstractVector, kern::SlidingKernel, border)
+    _imfilter_dct_line!(r, out, img, kern, CartesianIndices(()), axes(img, 1), CartesianIndices(()), border)
 end
 
-function _imfilter_dct_line!(out, img, kernel::SlidingKernel, Rpre, ind, Rpost, border::Pad)
+function _imfilter_dct_line!(r, out, img, kernel::SlidingKernel, Rpre, ind, Rpost, border::Pad)
     N = kernel.N
     pidx = padindex(border, N, ind, N)
-    _imfilter_dct!(out, img, kernel, Rpre, ind, Rpost, pidx, nothing, zero(eltype(Rpre)), zero(eltype(Rpost)))
+    _imfilter_dct!(r, out, img, kernel, Rpre, ind, Rpost, pidx, nothing, zero(eltype(Rpre)), zero(eltype(Rpost)))
 end
-function _imfilter_dct_line!(out, img, kernel::SlidingKernel, Rpre, ind, Rpost, border::Fill)
+function _imfilter_dct_line!(r, out, img, kernel::SlidingKernel, Rpre, ind, Rpost, border::Fill)
     N = kernel.N
     # out-of-bounds positions are marked by a sentinel and replaced by the fill value
     pidx = OffsetArray([checkindex(Bool, ind, t) ? t : typemin(Int) for t in first(ind)-N:last(ind)+N], first(ind)-N:last(ind)+N)
-    _imfilter_dct!(out, img, kernel, Rpre, ind, Rpost, pidx, border.value, zero(eltype(Rpre)), zero(eltype(Rpost)))
+    _imfilter_dct!(r, out, img, kernel, Rpre, ind, Rpost, pidx, border.value, zero(eltype(Rpre)), zero(eltype(Rpost)))
 end
 
 # With explicit padding: `out[I]` depends on `A[I + J]`, and we index the parent of
 # padded (Offset) arrays directly for speed (see also the FIR specializations above)
 function _imfilter_inbounds!(r::AbstractResource, out, A::AbstractArray, kern::ReshapedSliding, border::NoPad, inds)
     Rpre, ind, Rpost = iterdims(inds, kern)
-    _imfilter_dct_padded!(out, A, kern.data, Rpre, ind, Rpost, ntuple(_ -> 0, ndims(A)), kern)
+    _imfilter_dct_padded!(r, out, A, kern.data, Rpre, ind, Rpost, ntuple(_ -> 0, ndims(A)), kern)
 end
 function _imfilter_inbounds!(r::AbstractResource, out, A::OffsetArray, kern::ReshapedSliding, border::NoPad, inds)
     Rpre, ind, Rpost = iterdims(inds, kern)
-    _imfilter_dct_padded!(out, parent(A), kern.data, Rpre, ind, Rpost, A.offsets, kern)
+    _imfilter_dct_padded!(r, out, parent(A), kern.data, Rpre, ind, Rpost, A.offsets, kern)
 end
 function _imfilter_inbounds!(r::AbstractResource, out, A::AbstractVector, kern::SlidingKernel, border::NoPad, inds)
-    _imfilter_dct_padded!(out, A, kern, CartesianIndices(()), inds[1], CartesianIndices(()), (0,), ReshapedOneD{1,0}(kern))
+    _imfilter_dct_padded!(r, out, A, kern, CartesianIndices(()), inds[1], CartesianIndices(()), (0,), ReshapedOneD{1,0}(kern))
 end
 function _imfilter_inbounds!(r::AbstractResource, out, A::OffsetVector, kern::SlidingKernel, border::NoPad, inds)
-    _imfilter_dct_padded!(out, parent(A), kern, CartesianIndices(()), inds[1], CartesianIndices(()), A.offsets, ReshapedOneD{1,0}(kern))
+    _imfilter_dct_padded!(r, out, parent(A), kern, CartesianIndices(()), inds[1], CartesianIndices(()), A.offsets, ReshapedOneD{1,0}(kern))
 end
-function _imfilter_dct_padded!(out, A, kernel, Rpre, ind, Rpost, offsets, kern)
+function _imfilter_dct_padded!(r, out, A, kernel, Rpre, ind, Rpost, offsets, kern)
     Opre, o, Opost = KernelFactors.indexsplit(CartesianIndex(offsets), kern)
     N = kernel.N
     pidx = OffsetArray((first(ind)-N:last(ind)+N) .- o, first(ind)-N:last(ind)+N)
-    _imfilter_dct!(out, A, kernel, Rpre, ind, Rpost, pidx, nothing, Opre, Opost)
+    _imfilter_dct!(r, out, A, kernel, Rpre, ind, Rpost, pidx, nothing, Opre, Opost)
+end
+
+# Multithreading: the lines are independent, and each call to the workhorse below
+# allocates its own state, so blocks of lines can be filtered by separate tasks with a
+# result identical to serial filtering. As for FIRTiled, there is (at most) one block per
+# thread; each task gets at least `dct_task_pixels` output pixels, so that small arrays
+# are not slowed down by the cost of spawning tasks.
+const dct_task_pixels = 2^15
+function _imfilter_dct!(r::AbstractResource, out, A, kernel, Rpre, ind, Rpost, pidx, fillvalue, Opre, Opost)
+    _imfilter_dct!(out, A, kernel, Rpre, ind, Rpost, pidx, fillvalue, Opre, Opost)
+end
+function _imfilter_dct!(r::CPUThreads, out, A, kernel, Rpre, ind, Rpost, pidx, fillvalue, Opre, Opost)
+    ntasks = min(Threads.nthreads(), cld(length(Rpre) * length(ind) * length(Rpost), dct_task_pixels))
+    _imfilter_dct_tasks!(ntasks, out, A, kernel, Rpre, ind, Rpost, pidx, fillvalue, Opre, Opost)
+end
+# This must be in a separate function due to #15276
+@noinline function _imfilter_dct_tasks!(ntasks, out, A, kernel, Rpre, ind, Rpost, pidx, fillvalue, Opre, Opost)
+    blocks = _dct_blocks(Rpre, Rpost, ntasks)
+    length(blocks) == 1 && return _imfilter_dct!(out, A, kernel, Rpre, ind, Rpost, pidx, fillvalue, Opre, Opost)
+    @sync for (Bpre, Bpost) in blocks
+        Threads.@spawn _imfilter_dct!(out, A, kernel, Bpre, ind, Bpost, pidx, fillvalue, Opre, Opost)
+    end
+    return out
+end
+
+# Split the lines into at most `ntasks` blocks, preferably along the longest dimension
+# after the filtered one (each block is then a set of whole slabs), otherwise along the
+# outermost dimension before it. Blocks along the first dimension, which is contiguous in
+# memory and over which the inner loop runs, keep at least `minlines` lines.
+function _dct_blocks(Rpre::CartesianIndices, Rpost::CartesianIndices, ntasks::Integer; minlines::Integer = 16)
+    lpost = collect(map(length, Rpost.indices))
+    dpost = isempty(lpost) ? 0 : argmax(lpost)
+    npost = dpost == 0 ? 1 : min(ntasks, lpost[dpost])
+    dpre = ndims(Rpre)
+    npre = dpre == 0 ? 1 : max(1, min(ntasks, fld(length(Rpre.indices[dpre]), dpre == 1 ? minlines : 1)))
+    if npost >= npre
+        npost == 1 && return [(Rpre, Rpost)]
+        return [(Rpre, B) for B in _splitdim(Rpost, dpost, npost)]
+    end
+    return [(B, Rpost) for B in _splitdim(Rpre, dpre, npre)]
+end
+# Split dimension `d` of `R` into `n` blocks whose lengths differ by at most 1
+function _splitdim(R::CartesianIndices, d::Integer, n::Integer)
+    inds = UnitRange(R.indices[d])
+    q, m = divrem(length(inds), n)
+    parts = [first(inds)+(i-1)*q+min(i-1, m):first(inds)+i*q+min(i, m)-1 for i in 1:n]
+    return [CartesianIndices(Base.setindex(R.indices, part, d)) for part in parts]
 end
 
 # This is the "workhorse" function. Like _imfilter_dim! for TriggsSdika, the filtered
@@ -1554,6 +1601,7 @@ function kernelconv(k1, k2, kernels...)
 end
 
 default_resource(alg::FIRTiled) = Threads.nthreads() > 1 ? CPUThreads(alg) : CPU1(alg)
+default_resource(alg::DCT) = Threads.nthreads() > 1 ? CPUThreads(alg) : CPU1(alg)
 default_resource(alg) = CPU1(alg)
 
 function alg_defaults(alg::FIRTiled{0}, out, kernel)
